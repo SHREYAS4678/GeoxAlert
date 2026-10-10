@@ -1,0 +1,28 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.streamlit/secrets.toml
+dashboard/.streamlit/secrets.toml
+.env
+.env.*
+!.env.example
+
+# Firmware secrets and build products
+firmware/include/secrets.h
+firmware/.pio/
+.pio/
+.vscode/
+
+# Private service-account keys and credentials
+private/
+*firebase-adminsdk*.json
+*service-account*.json
+*service_account*.json
+*credential*.json
+
+# Local datasets/models/logs
+*.log
+data/*.csv
+models/
