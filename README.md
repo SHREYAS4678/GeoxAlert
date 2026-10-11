@@ -19,8 +19,8 @@ The repository intentionally excludes local credentials, model binaries and CSV 
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
-.`.`scripts`.`setup.ps1
-.`.`scripts`.`configure.ps1
+.\scripts\setup.ps1
+.\scripts\configure.ps1
 ```
 
 After rotating the exposed credentials, complete the local prompts. Keep `geoalert-node-01` as the Node ID unless intentionally changing it. Do not enable direct GSM SMS until the exact SIM800L board power, SIM readiness, antenna and network registration have been checked.
@@ -34,7 +34,7 @@ The included training dataset has these predictors:
 Target: numeric `label` (classes 0 and 1). To retrain on Windows, make sure `data/geoalert_training_dataset.csv` exists, then run:
 
 ```powershell
-.`.`scripts`.`train-models.ps1
+.\scripts\train-models.ps1
 ```
 
 The script writes `models/random_forest_model.pkl`, `models/xgboost_model.pkl`, `models/voting_ensemble_model.pkl`, `models/scaler.pkl`, `models/feature_order.json`, and reports under `reports/`.
@@ -61,9 +61,9 @@ See [training results and limitations](docs/training-results.md). These unusuall
 ## Build and upload firmware
 
 ```powershell
-.`.`scripts`.`build-firmware.ps1
-.`.`scripts`.`upload-firmware.ps1
-.`.`scripts`.`monitor-serial.ps1
+.\scripts\build-firmware.ps1
+.\scripts\upload-firmware.ps1
+.\scripts\monitor-serial.ps1
 ```
 
 The uploader asks for a COM port. Close the serial monitor before uploading. Pin map: soil GPIO 34, FC-37 GPIO 35, DHT22 GPIO 4, SW-420 GPIO 5, I2C SDA 21/SCL 22, SIM800L TXD to ESP32 RX GPIO 16 and ESP32 TX GPIO 17 to SIM800L RXD. Power SIM800L according to the exact V2 board specification with sufficient transient current and a shared ground.
@@ -71,7 +71,7 @@ The uploader asks for a COM port. Close the serial monitor before uploading. Pin
 ## Run dashboard
 
 ```powershell
-.`.`scripts`.`run-dashboard.ps1
+.\scripts\run-dashboard.ps1
 ```
 
 Open http://localhost:8501. This version is a Streamlit-only dashboard and does not need the previous port-8000 backend. Without correct Firebase access, readings may be demo/offline values rather than live sensor data.
@@ -81,7 +81,7 @@ Open http://localhost:8501. This version is a Streamlit-only dashboard and does 
 Configure new Twilio credentials and a newly generated Firebase Admin service account locally, then run:
 
 ```powershell
-.`.`scripts`.`run-alert-worker.ps1
+.\scripts\run-alert-worker.ps1
 ```
 
 Each queued message needs an explicit recipient phone number. Queueing is not proof of delivery; check Twilio and worker status. Charges may apply. Direct SIM800L SMS is an opt-in prototype. No physical siren or relay is installed.
