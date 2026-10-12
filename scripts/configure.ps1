@@ -43,9 +43,6 @@ $node = Read-Host 'Node ID [geoalert-node-01]'
 if ([string]::IsNullOrWhiteSpace($node)) { $node = 'geoalert-node-01' }
 $apn = Read-Host 'SIM800L GPRS APN [www]'
 if ([string]::IsNullOrWhiteSpace($apn)) { $apn = 'www' }
-$phone = Read-Host 'Optional direct-SMS destination in +countrycode format (blank disables direct SMS)'
-$direct = Read-Host 'Enable prototype direct SIM800L SMS? Type YES only after testing modem/network [no]'
-$directEnabled = ($direct -ceq 'YES' -and -not [string]::IsNullOrWhiteSpace($phone))
 
 $header = @(
     '#pragma once',
@@ -60,8 +57,6 @@ $header = @(
     "#define GEOALERT_GPRS_APN $(CQuote $apn)",
     '#define GEOALERT_GPRS_USER ""',
     '#define GEOALERT_GPRS_PASS ""',
-    "#define GEOALERT_ALERT_PHONE $(CQuote $phone)",
-    "#define GEOALERT_DIRECT_SMS_ENABLED $($directEnabled.ToString().ToLowerInvariant())"
 )
 Write-Utf8NoBom '.\firmware\include\secrets.h' $header
 
@@ -78,4 +73,5 @@ Write-Host ''
 Write-Host 'Local configuration files created:' -ForegroundColor Green
 Write-Host '  firmware/include/secrets.h'
 Write-Host '  dashboard/.streamlit/secrets.toml'
+Write-Host 'Multi-recipient SMS is queued in Firebase and consumed by the ESP32/SIM800L after firmware upload.' -ForegroundColor Yellow
 Write-Host 'These files are ignored by Git. Never upload or share them.' -ForegroundColor Yellow
