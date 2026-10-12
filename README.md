@@ -1,37 +1,58 @@
-# GeoAlert — AI/IoT landslide-monitoring prototype
+# GeoAlert — AI + IoT landslide-monitoring prototype
 
-GeoAlert combines ESP32 sensor telemetry, Firebase Realtime Database, and a Streamlit Command Hub with an interactive architecture diagram, weighted hazard score, infinite-slope Factor of Safety (FoS), forecasts, anomaly checks and reports.
+GeoAlert samples environmental and slope-orientation sensors on an ESP32 every five seconds, stores telemetry in Firebase Realtime Database, visualizes readings and analytics in a Streamlit dashboard, and uses a Firebase queue consumed by the ESP32/SIM800L to send messages to multiple registered contacts.
 
-> **Security:** Wi-Fi and Firebase credentials, plus a Firebase service-account private key, were shared during troubleshooting. Treat them as compromised: change the Wi-Fi and Firebase Authentication passwords, revoke/delete the exposed service-account key in Google Cloud IAM, and restrict the Firebase Web API key. This version does not require a Firebase service-account file for its dashboard or firmware path. Never commit local secrets or service-account JSON.
+> **Credential warning:** A Wi-Fi password and Firebase credentials were included in the reference firmware shared during troubleshooting. Treat them as exposed: rotate the Wi-Fi password and Firebase Authentication password, restrict the Firebase Web API key, and revoke/delete the exposed Admin SDK service-account key in Google Cloud IAM. This redesigned dashboard/firmware path does not need an Admin SDK service-account JSON. Never commit `firmware/include/secrets.h` or `dashboard/.streamlit/secrets.toml`.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    A["Sensors<br/>Soil moisture · FC-37<br/>DHT22 · SW-420 · IMU"] --> B["ESP32 edge<br/>JSON telemetry"]
+    A["Sensors<br/>Capacitive soil moisture<br/>FC-37 rain index<br/>DHT22 · SW-420 · MPU6050"] -->|every 5 seconds| B["ESP32 edge node<br/>sensor checks + combined tilt<br/>JSON telemetry"]
     B --> C["Network failover<br/>Wi-Fi primary<br/>SIM800L GPRS fallback"]
-    B <--> D["LittleFS offline queue<br/>Buffer / replay"]
-    C --> E[("Firebase Realtime Database")]
-    E --> F["Streamlit Command Hub"]
-    F --> G["Risk score · FoS<br/>Forecasts · Health<br/>Analytics · Exports"]
-    B -. "optional, disabled by default" .-> H["Direct SIM800L SMS"]
+    B <--> D["LittleFS buffer<br/>offline spool / replay"]
+    C --> E[("Firebase Realtime Database<br/>live · history · contacts<br/>alerts/queue")]
+    E --> F["Streamlit Command Hub<br/>live cards · visualization · ML"]
+    F --> G["Risk score · FoS<br/>forecast · health · reports"]
+    F --> H["Recipient directory<br/>name + phone + active flag"]
+    H --> E
+    F --> I["Manual or automatic risk queue"]
+    I --> E
+    E --> J["ESP32 queue consumer"]
+    J --> K["SIM800L SMS<br/>send to recipients in order"]
+    K --> E
 ```
 
-The dashboard also includes an interactive Plotly architecture visualization. Telemetry paths are `/nodes/<node_id>/live` and `/nodes/<node_id>/history`. When both network links are unavailable, firmware can spool records to LittleFS and replay them after reconnection.
+The dashboard also has an interactive Plotly **Architecture** tab. Live telemetry is stored at `/nodes/<node_id>/live`, history at `/nodes/<node_id>/history`, contacts at `/nodes/<node_id>/contacts`, and SMS jobs at `/nodes/<node_id>/alerts/queue`.
 
-## Repository contents
+## End-to-end operation
 
-- `firmware/src/main.cpp` and `firmware/platformio.ini`: ESP32 Arduino/PlatformIO firmware for soil moisture, FC-37, DHT22, SW-420, MPU-compatible IMU, Firebase REST, Wi-Fi/GPRS failover and LittleFS spool.
-- `dashboard/app.py`: Streamlit Command Hub, Firebase live reader, hazard calculations, history, architecture visualization and exports.
-- `train_models.py`: reproducible Random Forest, XGBoost and soft-voting training pipeline.
-- `scripts/`: PowerShell configuration, setup, training, firmware build/upload/monitor and dashboard launchers.
-- `docs/`: architecture, Firebase configuration and ML evaluation caveats.
+1. **Sensor sampling:** capacitive soil-moisture ADC, FC-37 rain/wetness index, DHT22 temperature/humidity, SW-420 vibration pulses, and MPU6050 pitch/roll/yaw are sampled every five seconds.
+2. **Consistent slope tilt:** the firmware and dashboard derive a single inclination value from both MPU6050 pitch and roll using the same formula. The dashboard's Slope Tilt value is not a separate sensor.
+3. **Network and storage:** Wi-Fi is primary; SIM800L GPRS is the fallback. LittleFS buffers telemetry while both links are unavailable and replays it after reconnection.
+4. **Firebase:** stores live telemetry, historical samples, names/phone numbers, and queued SMS requests.
+5. **Streamlit:** shows real-time readings, hazard tier, factor of safety, history, forecasts, node health, model prediction and alert queue status. Operators can add, deactivate, and remove recipients.
+6. **SMS:** the dashboard can queue a message for all active contacts. Automatic queueing is opt-in and responds to a live escalation to HIGH RISK or CRITICAL. The ESP32 polls the queue, sends messages sequentially using SIM800L, and records per-recipient results.
 
-Local credentials, model binaries and CSV files are excluded via `.gitignore`. Copy the training CSV into `data/geoalert_training_dataset.csv` before retraining.
+Queueing is not proof of SMS delivery. SMS requires stable SIM800L power, a ready SIM, cellular SMS service, and Firebase connectivity for the ESP32 to read and update the queue. No physical siren or relay is installed.
 
-## Quick start (Windows PowerShell)
+## Machine learning
 
-From the GeoAlert project root:
+The repository contains `data/geoalert_training_dataset.csv`, trained artifacts under `models/`, evaluation reports under `reports/`, and `train_models.py`. The pipeline trains Random Forest, XGBoost, and a soft-voting ensemble. The dashboard loads the ensemble for **experimental binary inference**.
+
+The supplied dataset has features `soil_moisture, rainfall, temperature, humidity, roll, pitch, yaw, vibration` and binary target `label`. A stratified random 80/20 holdout reported about 99.65–99.70% accuracy on that dataset. **This is test-split accuracy, not demonstrated field accuracy.** The meaning of labels 0 and 1 is not documented, and dataset rainfall units have not been confirmed as equivalent to the FC-37 rain index. The dashboard displays `Label 0`/`Label 1` and probabilities, but does not map that output directly to operational risk tiers or SMS.
+
+To retrain with labelled, documented, site-relevant data:
+
+```powershell
+.\scripts\train-models.ps1
+```
+
+Do not tune to a fixed 90–99% target by repeatedly inspecting the test set. Evaluate on separate sites/time periods and review false negatives before considering any safety-related use.
+
+## Windows setup
+
+Run from the project root:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
@@ -39,42 +60,21 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\configure.ps1
 ```
 
-Complete the Wi-Fi and Firebase prompts using newly rotated credentials. Keep `geoalert-node-01` as the Node ID unless the firmware intentionally uses another ID. Direct SIM800L SMS is optional, firmware-side, and disabled by default. No physical siren or relay is installed.
+Use newly rotated Wi-Fi/Firebase credentials. The configuration script creates local-only `firmware/include/secrets.h` and `dashboard/.streamlit/secrets.toml`.
 
-## Train models
+### Firebase rules
 
-The supplied dataset predictors are:
-
-`soil_moisture, rainfall, temperature, humidity, roll, pitch, yaw, vibration`
-
-The target is numeric `label` (classes 0 and 1). To retrain on Windows, ensure `data/geoalert_training_dataset.csv` exists, then run:
+The repository includes `firebase.json`, `.firebaserc`, and `database.rules.json`. Review the sample rules before deployment—deploying replaces the currently deployed database rules:
 
 ```powershell
-.\scripts\train-models.ps1
+firebase login
+firebase use geoalert-ai-ee1fd
+firebase deploy --only database --project geoalert-ai-ee1fd
 ```
 
-The script writes trained models under `models/` and evaluation reports under `reports/`.
+The sample rules allow authenticated users to read node data and to write required live/history/contact/queue paths. They are a prototype baseline, not full per-user authorization.
 
-### Holdout metrics for the supplied CSV
-
-A stratified 80/20 holdout with seed 42 yielded:
-
-| Model | Accuracy | Macro F1 | ROC-AUC |
-|---|---:|---:|---:|
-| Random Forest | 99.70% | 99.70% | 0.9997 |
-| XGBoost | 99.65% | 99.65% | 0.9998 |
-| Soft-voting ensemble | 99.65% | 99.65% | 0.9997 |
-
-These unusually strong metrics apply to the supplied dataset only and do not prove real-world landslide performance. See `docs/training-results.md`.
-
-### Critical ML limitations
-
-- The dataset does not define whether label 0 or 1 means normal, risk or landslide. It is binary and does not produce four hazard tiers.
-- The rainfall unit is undocumented. FC-37 provides a wetness/index reading, not calibrated rainfall in millimetres.
-- Firmware sensor units, IMU angle conventions and vibration aggregation must match the dataset before live model inference.
-- The current dashboard uses a weighted heuristic and Factor of Safety. The trained artifacts are not wired into the live hazard tier. Do not treat binary classes as operational hazard tiers without validating semantics and units.
-
-## Build and upload firmware
+## Build, upload, monitor
 
 ```powershell
 .\scripts\build-firmware.ps1
@@ -82,18 +82,16 @@ These unusually strong metrics apply to the supplied dataset only and do not pro
 .\scripts\monitor-serial.ps1
 ```
 
-The uploader asks for a COM port. Close the serial monitor before uploading. Pin map: soil GPIO 34, FC-37 GPIO 35, DHT22 GPIO 4, SW-420 GPIO 5, I2C SDA 21/SCL 22, SIM800L TXD to ESP32 RX GPIO 16 and ESP32 TX GPIO 17 to SIM800L RXD. Follow the exact SIM800L V2 board power requirements and use a shared ground.
+Close the serial monitor before uploading. Default pins: soil GPIO 34, FC-37 GPIO 35, DHT22 GPIO 4, SW-420 GPIO 5, I²C SDA 21/SCL 22, SIM800L TXD → ESP32 RX GPIO 16 and ESP32 TX GPIO 17 → SIM800L RXD. Follow the exact SIM800L V2 board power specification and use a shared ground.
 
-## Run dashboard
+## Run the dashboard
 
 ```powershell
 .\scripts\run-dashboard.ps1
 ```
 
-Open http://localhost:8501. The dashboard is Streamlit-only and does not require a separate port-8000 API. If Firebase access is misconfigured, values may be demo/offline rather than live sensor readings.
+Open `http://localhost:8501`. If it shows OFFLINE / DEMO, check Firebase Authentication, the database URL/rules, the selected node ID, and the ESP32 serial output. NTP time is used for calendar timestamps when available; uptime-only timestamps are not treated as real calendar times.
 
-## Alerts and safety
+## Safety and validation
 
-The dashboard records and displays events. Optional webhook escalation notifications can be configured in the sidebar. Direct SMS through SIM800L is a separate optional firmware feature and is disabled by default. This version has no cloud SMS worker or dashboard SMS queue; no physical siren or relay is installed. Logging or displaying an event does not prove that a person received an alert.
-
-GeoAlert is an experimental decision-support prototype, not a certified landslide-warning system. Do not use it as the sole basis for evacuation or public-safety decisions. Validate sensors, soil/geotechnical parameters, thresholds and alert procedures with qualified personnel and local authorities.
+GeoAlert is an experimental decision-support prototype, not a certified landslide-warning system. Do not use it as the sole basis for evacuation or public-safety decisions. Validate sensors, field units, soil/geotechnical parameters, ML label semantics, thresholds and SMS delivery with qualified personnel and local authorities.
