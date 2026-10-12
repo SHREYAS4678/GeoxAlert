@@ -140,19 +140,6 @@ def fb_get(path: str, params: dict | None = None):
         return None
 
 
-def fb_write(path: str, payload: dict, push: bool = False, live: bool = True):
-    """Write to RTDB -> (ok, message). Simulated when there's no live connection."""
-    token = get_token()
-    if not live and not token:
-        return True, "Simulated (no live connection) - nothing was sent."
-    try:
-        fn = requests.post if push else requests.put
-        r = fn(f"{db_url.rstrip('/')}/{path}.json", params={"auth": token} if token else None, json=payload, timeout=7)
-        r.raise_for_status()
-        return True, "written to Firebase"
-    except Exception as err:
-        return False, f"write failed: {err}"
-
 
 def list_nodes():
     s = st.session_state
@@ -1339,29 +1326,106 @@ def tab_health(S):
         st.caption("Power telemetry: " + ", ".join(f"{k} = {v:g}" for k, v in S.extras.items()))
 
 
+
+def architecture_figure():
+    """Plotly architecture diagram; no additional visualization dependency needed."""
+    fig = go.Figure()
+    nodes = [
+        {"x0": 0.15, "x1": 2.15, "y0": 2.55, "y1": 3.90, "title": "Sensor layer",
+         "body": "Soil moisture • FC-37<br>DHT22 • SW-420 • MPU6050", "color": "#38BDF8"},
+        {"x0": 2.55, "x1": 4.55, "y0": 2.55, "y1": 3.90, "title": "ESP32 edge",
+         "body": "Read sensors • validate<br>Create telemetry JSON", "color": "#818CF8"},
+        {"x0": 4.95, "x1": 6.95, "y0": 2.55, "y1": 3.90, "title": "Network uplink",
+         "body": "Wi-Fi primary<br>SIM800L GPRS fallback", "color": "#34D399"},
+        {"x0": 7.35, "x1": 9.35, "y0": 2.55, "y1": 3.90, "title": "Firebase RTDB",
+         "body": "/nodes/{id}/live<br>/nodes/{id}/history", "color": "#FBBF24"},
+        {"x0": 9.75, "x1": 11.85, "y0": 2.55, "y1": 3.90, "title": "Streamlit Hub",
+         "body": "Risk score • FoS<br>Forecasts • health • exports", "color": "#F472B6"},
+        {"x0": 2.65, "x1": 4.45, "y0": 0.45, "y1": 1.50, "title": "LittleFS offline queue",
+         "body": "Store locally if both links fail", "color": "#94A3B8"},
+    ]
+    connectors = [
+        (2.15, 3.22, 2.55, 3.22), (4.55, 3.22, 4.95, 3.22),
+        (6.95, 3.22, 7.35, 3.22), (9.35, 3.22, 9.75, 3.22),
+        (3.15, 2.55, 3.15, 1.50), (3.95, 1.50, 3.95, 2.55),
+    ]
+    for x0, y0, x1, y1 in connectors:
+        fig.add_annotation(
+            x=x1, y=y1, ax=x0, ay=y0, xref="x", yref="y", axref="x", ayref="y",
+            text="", showarrow=True, arrowhead=2, arrowsize=1.1,
+            arrowwidth=2, arrowcolor="#94A3B8",
+        )
+    for n in nodes:
+        fig.add_shape(
+            type="rect", x0=n["x0"], x1=n["x1"], y0=n["y0"], y1=n["y1"],
+            line={"color": n["color"], "width": 2},
+            fillcolor="rgba(15,23,42,0.96)", layer="below",
+        )
+        cx, cy = (n["x0"] + n["x1"]) / 2, (n["y0"] + n["y1"]) / 2
+        fig.add_annotation(
+            x=cx, y=cy + 0.20, text=f"<b>{n['title']}</b>", showarrow=False,
+            font={"size": 12, "color": n["color"]}, xanchor="center", yanchor="middle",
+        )
+        fig.add_annotation(
+            x=cx, y=cy - 0.19, text=n["body"], showarrow=False,
+            font={"size": 10, "color": "#E2E8F0"}, xanchor="center", yanchor="middle",
+        )
+    fig.add_annotation(x=4.50, y=1.98, text="buffer / replay", showarrow=False,
+                       font={"size": 9, "color": "#94A3B8"}, xanchor="left")
+    fig.update_layout(
+        height=455, margin={"l": 5, "r": 5, "t": 8, "b": 8},
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font={"color": "#E2E8F0"}, showlegend=False,
+    )
+    fig.update_xaxes(visible=False, range=[0, 12.0], fixedrange=True)
+    fig.update_yaxes(visible=False, range=[0.1, 4.25], fixedrange=True)
+    return fig
+
+
+def tab_architecture(S):
+    st.subheader("GeoAlert system architecture")
+    st.caption("End-to-end sensor data path for the selected node.")
+    st.plotly_chart(architecture_figure(), **WIDE, key="architecture_diagram")
+    m = st.columns(4)
+    m[0].metric("Telemetry", "LIVE" if S.is_live else "OFFLINE / DEMO")
+    m[1].metric("Node ID", NODE_ID)
+    m[2].metric("Active uplink", str(S.network.get("active_interface", "Unknown")))
+    m[3].metric("History source", "Firebase" if S.hist_is_real else "Synthetic fallback")
+
+    st.markdown("#### Data flow")
+    st.markdown(
+        "1. **Sensors → ESP32:** soil moisture, rain index, temperature, humidity, vibration and IMU readings are sampled and packaged as JSON.\\n"
+        "2. **ESP32 → network:** Wi-Fi is attempted first; SIM800L GPRS is the fallback. If both links fail, telemetry is buffered in LittleFS and replayed after reconnection.\\n"
+        "3. **Firebase Realtime Database:** live readings are written to /nodes/<node_id>/live; historical samples are written to /nodes/<node_id>/history.\\n"
+        "4. **Streamlit Command Hub:** reads Firebase data and visualizes sensor status, hazard score, infinite-slope Factor of Safety, history, forecasts, anomalies and reports."
+    )
+    st.info(
+        "This version has no cloud SMS worker and no physical siren/relay. "
+        "Direct SIM800L SMS is an optional firmware-side feature and is disabled by default; "
+        "webhook notifications can be configured separately."
+    )
+
+
 def tab_response(S):
-    st.subheader("Emergency dispatch & actuator control")
+    st.subheader("Alerts & event log")
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown("#### 📣 Incident broadcast")
-        zone = st.selectbox("Target zone", ["Western Ridge Sector 4", "Valley Catchment Basin 2", "All Monitored Sectors"], key="zone")
-        recipient = st.text_input("Recipient phone (+country code)", placeholder="+91XXXXXXXXXX", key="alert_recipient")
-        text = st.text_area("Alert message", f"GEOALERT {S.tier['name']}: landslide risk {S.score:.0f}/100 at {zone}. Move to higher, safe ground now.",
-                            height=110, key="alert_text")
-        ok_confirm = st.checkbox("I confirm this broadcast is authorised", key="confirm_bc")
-        if st.button("🚨 Queue emergency SMS", **WIDE, disabled=not (ok_confirm and recipient.strip()), key="btn_bc"):
-            ok, msg = fb_write("alerts/queue", {"zone": zone, "to": recipient.strip(), "message": text, "tier": S.tier["name"], "score": round(S.score, 1), "ts": S.stamp},
-                               push=True, live=S.is_live)
-            (st.success if ok else st.error)(f"Broadcast request: {msg}. A Twilio/SMS worker must consume `alerts/queue`.")
-            log_event("DISPATCH" if ok else "ERROR", f"SMS broadcast queued for {zone}: {msg}")
+        st.markdown("#### Current assessment")
+        st.metric("Hazard tier", S.tier["name"])
+        st.metric("Threat score", f"{S.score:.1f}/100")
+        st.metric("Factor of Safety", f"{S.fos:.2f}")
     with col2:
-        st.markdown("#### 📡 Alert delivery routes")
-        st.info("No physical siren or relay is fitted to this GeoAlert prototype. The dashboard queues cloud SMS requests at `alerts/queue`; the optional Twilio worker must be configured and running to deliver them.")
-        st.markdown("**Direct SIM800L SMS:** optional firmware feature, disabled by default in `firmware/include/secrets.h`; it requires a configured phone number, stable modem power, and compatible cellular service.")
-        st.markdown("**Twilio cloud SMS:** requires credentials in the local `.env` file and `scripts/run-alert-worker.ps1` running.")
-        st.caption("Queueing an alert is not confirmation of delivery. Check the alert queue status and modem/worker logs.")
-        st.markdown("#### 🔔 Notifications")
-        st.write("Webhook auto-notify is **ON**" if NOTIFY_ON and WEBHOOK else "Webhook auto-notify is **off** (enable in the sidebar).")
+        st.markdown("#### Notification configuration")
+        if NOTIFY_ON and WEBHOOK:
+            st.success("Webhook escalation notifications are enabled.")
+        else:
+            st.caption("Webhook escalation notifications are off. Configure them from the sidebar if needed.")
+        st.info(
+            "This dashboard records and displays events; it does not dispatch SMS. "
+            "Optional direct SIM800L SMS is configured in the firmware and is disabled by default. "
+            "No physical siren or relay is installed."
+        )
+
     st.markdown("#### Session alert log")
     log = st.session_state.alert_log
     unacked = sum(1 for a in log if not a.get("ack"))
@@ -1375,6 +1439,7 @@ def tab_response(S):
         show_df(pd.DataFrame(log))
     else:
         st.caption("No events yet.")
+
 
 
 def tab_export(S):
@@ -1457,10 +1522,10 @@ def render():
     m[5].metric("Air Humidity", f"{s['humidity_pct']:.0f}%")
     m[6].metric("Pitch / Roll", f"{s['pitch_deg']:.1f}° / {s['roll_deg']:.1f}°")
 
-    tabs = st.tabs(["🎯 Situation", "🗺️ Fleet", "🌐 3D Twin", "📈 Analytics", "🔮 Forecast", "🧪 Geotech Lab",
-                    "⏪ Replay", "🩺 Node Health", "🚨 Response", "📥 Reports & Export"])
-    for tab, fn in zip(tabs, (tab_situation, tab_fleet, tab_twin, tab_analytics, tab_forecast, tab_geotech,
-                              tab_replay, tab_health, tab_response, tab_export)):
+    tabs = st.tabs(["🎯 Situation", "🗺️ Fleet", "🌐 3D Twin", "🏗️ Architecture", "📈 Analytics", "🔮 Forecast",
+                    "🧪 Geotech Lab", "⏪ Replay", "🩺 Node Health", "🚨 Response", "📥 Reports & Export"])
+    for tab, fn in zip(tabs, (tab_situation, tab_fleet, tab_twin, tab_architecture, tab_analytics, tab_forecast,
+                              tab_geotech, tab_replay, tab_health, tab_response, tab_export)):
         with tab:
             fn(S)
 
