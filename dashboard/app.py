@@ -141,11 +141,58 @@ def fb_get(path: str, params: dict | None = None):
     if token:
         p["auth"] = token
     try:
-        r = requests.get(f"{db_url.rstrip('/')}/{path}.json", params=p, timeout=7)
-        r.raise_for_status()
-        return r.json()
-    except Exception:
+        response = requests.get(f"{db_url.rstrip('/')}/{path}.json", params=p, timeout=8)
+        response.raise_for_status()
+        st.session_state["db_error"] = None
+        return response.json()
+    except Exception as err:
+        st.session_state["db_error"] = str(err)
         return None
+
+
+def fb_write(path: str, payload: dict, push: bool = False):
+    """Authenticated Firebase RTDB write. Returns (success, message, generated_key)."""
+    token = get_token()
+    if not token:
+        return False, "Firebase authentication is unavailable; nothing was written.", None
+    try:
+        fn = requests.post if push else requests.put
+        response = fn(
+            f"{db_url.rstrip('/')}/{path}.json",
+            params={"auth": token},
+            json=payload,
+            timeout=8,
+        )
+        response.raise_for_status()
+        generated_key = None
+        if push:
+            try:
+                generated_key = response.json().get("name")
+            except (ValueError, AttributeError):
+                generated_key = None
+        st.session_state["db_error"] = None
+        return True, "Saved to Firebase.", generated_key
+    except Exception as err:
+        st.session_state["db_error"] = str(err)
+        return False, f"Firebase write failed: {err}", None
+
+
+def fb_delete(path: str):
+    token = get_token()
+    if not token:
+        return False, "Firebase authentication is unavailable."
+    try:
+        response = requests.delete(
+            f"{db_url.rstrip('/')}/{path}.json",
+            params={"auth": token},
+            timeout=8,
+        )
+        response.raise_for_status()
+        st.session_state["db_error"] = None
+        return True, "Removed from Firebase."
+    except Exception as err:
+        st.session_state["db_error"] = str(err)
+        return False, f"Firebase delete failed: {err}", None
 
 
 
