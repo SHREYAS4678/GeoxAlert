@@ -21,6 +21,7 @@
 #include <ArduinoJson.h>
 
 #include <LittleFS.h>
+#include <time.h>
 #include <math.h>
 #include "secrets.h"
 
@@ -41,8 +42,6 @@ const char* DEVICE_ID = GEOALERT_DEVICE_ID;
 const char* GPRS_APN = GEOALERT_GPRS_APN;
 const char* GPRS_USER = GEOALERT_GPRS_USER;
 const char* GPRS_PASS = GEOALERT_GPRS_PASS;
-const char* ALERT_PHONE = GEOALERT_ALERT_PHONE;
-const bool DIRECT_SMS_ENABLED = GEOALERT_DIRECT_SMS_ENABLED;
 
 // ============================================================
 
@@ -233,6 +232,8 @@ bool mpuStarted = false;
 unsigned long lastSensorSend = 0;
 
 unsigned long lastNetworkTry = 0;
+unsigned long lastSmsQueuePoll = 0;
+const unsigned long SMS_QUEUE_POLL_MS = 10000UL;
 
 bool modemReadyForSMS = false;
 unsigned long lastDirectSmsAt = 0;
@@ -271,6 +272,23 @@ const char* networkName() {
 // WIFI
 
 // ============================================================
+
+void syncClockWiFi() {
+    configTime(0, 0, "pool.ntp.org", "time.google.com");
+    struct tm timeInfo;
+    const unsigned long start = millis();
+    while (millis() - start < 7000UL) {
+        if (getLocalTime(&timeInfo, 500)) {
+            time_t epochNow = time(nullptr);
+            if (epochNow > 1700000000) {
+                Serial.println("[TIME] UTC clock synchronized");
+                return;
+            }
+        }
+        delay(200);
+    }
+    Serial.println("[TIME] NTP unavailable; uptime timestamps will be marked");
+}
 
 bool connectWiFi() {
 
@@ -315,6 +333,7 @@ bool connectWiFi() {
     if (WiFi.status() == WL_CONNECTED) {
 
         activeConnection = CONN_WIFI;
+        syncClockWiFi();
 
         Serial.println("[WiFi] CONNECTED");
 
@@ -1113,8 +1132,66 @@ bool firebaseGSMUpload(
 }
 
 // ============================================================
+// FIREBASE QUEUE READ / WRITE HELPERS
+// ============================================================
 
-// ENSURE NETWORK
+bool firebaseWiFiRead(const String& pathWithQuery, String& response) {
+    const bool expired = tokenLife > 60000UL && (millis() - tokenCreated >= tokenLife - 60000UL);
+    if (idToken.length() == 0 || expired) {
+        idToken = "";
+        if (!firebaseLoginWiFi()) return false;
+    }
+    String url = String(FIREBASE_DB_URL) + pathWithQuery;
+    url += (url.indexOf('?') >= 0) ? "&auth=" : "?auth=";
+    url += idToken;
+    HTTPClient http;
+    if (!http.begin(wifiClient, url)) {
+        Serial.println("[Firebase WiFi] GET begin failed");
+        return false;
+    }
+    const int code = http.GET();
+    response = http.getString();
+    http.end();
+    Serial.print("[Firebase WiFi] GET HTTP: ");
+    Serial.println(code);
+    return code >= 200 && code < 300;
+}
+
+bool firebaseGSMRead(const String& pathWithQuery, String& response) {
+    const bool expired = tokenLife > 60000UL && (millis() - tokenCreated >= tokenLife - 60000UL);
+    if (idToken.length() == 0 || expired) {
+        idToken = "";
+        if (!firebaseLoginGSM()) return false;
+    }
+    String fullPath = pathWithQuery;
+    fullPath += (fullPath.indexOf('?') >= 0) ? "&auth=" : "?auth=";
+    fullPath += idToken;
+    String rawResponse;
+    if (!gsmHTTPSRequest(
+            "geoalert-ai-ee1fd-default-rtdb.asia-southeast1.firebasedatabase.app",
+            fullPath, "", "GET", rawResponse)) return false;
+    const int bodyStart = rawResponse.indexOf("\r\n\r\n");
+    if (bodyStart < 0) return false;
+    response = rawResponse.substring(bodyStart + 4);
+    return true;
+}
+
+bool firebaseReadActive(const String& pathWithQuery, String& response) {
+    if (activeConnection == CONN_WIFI && WiFi.status() == WL_CONNECTED)
+        return firebaseWiFiRead(pathWithQuery, response);
+    if (activeConnection == CONN_GSM && modem.isGprsConnected())
+        return firebaseGSMRead(pathWithQuery, response);
+    return false;
+}
+
+bool firebasePutActive(const String& path, const String& payload) {
+    if (activeConnection == CONN_WIFI && WiFi.status() == WL_CONNECTED)
+        return firebaseWiFiUpload(path, payload, true);
+    if (activeConnection == CONN_GSM && modem.isGprsConnected())
+        return firebaseGSMUpload(path, payload, true);
+    return false;
+}
+
 
 // ============================================================
 
@@ -1608,9 +1685,14 @@ String createTelemetry() {
 
         DEVICE_ID;
 
-    json["timestamp"] =
-
-        millis();
+    time_t epochNow = time(nullptr);
+    if (epochNow > 1700000000) {
+        json["timestamp"] = static_cast<uint64_t>(epochNow) * 1000ULL;
+        json["timestamp_format"] = "unix_ms";
+    } else {
+        json["timestamp"] = millis();
+        json["timestamp_is_uptime"] = true;
+    }
 
     json["network_status"]
 
@@ -1648,9 +1730,15 @@ String createTelemetry() {
 
         pitchDeg;
 
-    sensors["yaw_deg"] =
+    sensors["yaw_deg"] = yawDeg;
 
-        yawDeg;
+    // Combined slope inclination: use both MPU6050 pitch and roll.
+    const float pitchRad = pitchDeg * PI / 180.0f;
+    const float rollRad = rollDeg * PI / 180.0f;
+    const float tiltCos = constrain(cosf(pitchRad) * cosf(rollRad), -1.0f, 1.0f);
+    const float slopeTiltDeg = acosf(tiltCos) * 180.0f / PI;
+    sensors["tilt_angle_deg"] = slopeTiltDeg;
+    sensors["slope_tilt_deg"] = slopeTiltDeg;
 
     sensors["vibration_pulses"] =
 
@@ -2063,35 +2151,136 @@ void replayLittleFS() {
 // OPTIONAL DIRECT SIM800L SMS ALERTS
 bool ensureModemReadyForSMS() {
     if (modemReadyForSMS && modem.isNetworkConnected()) return true;
-    Serial.println("[SMS] Preparing SIM800L for direct SMS...");
+    Serial.println("[SMS] Preparing SIM800L for SMS...");
     simSerial.begin(9600, SERIAL_8N1, PIN_SIM_RX, PIN_SIM_TX);
-    delay(500);
-    if (!modem.testAT() || !modem.init()) { Serial.println("[SMS] Modem did not initialize."); return false; }
-    if (modem.getSimStatus() != 1 || !modem.waitForNetwork(GSM_TIMEOUT)) { Serial.println("[SMS] SIM or network is not ready."); return false; }
+    delay(300);
+    // Do not reinitialize a responding modem: that could disrupt GPRS/Firebase.
+    if (!modem.testAT()) {
+        if (!modem.init()) {
+            Serial.println("[SMS] Modem initialization failed.");
+            return false;
+        }
+    }
+    if (modem.getSimStatus() != 1 || !modem.waitForNetwork(GSM_TIMEOUT)) {
+        Serial.println("[SMS] SIM or cellular network is not ready.");
+        return false;
+    }
     modemReadyForSMS = true;
     return true;
 }
-void maybeSendDirectSMS(const String& payload) {
-    if (!DIRECT_SMS_ENABLED) return;
-    if (ALERT_PHONE == nullptr || String(ALERT_PHONE).length() < 7 || String(ALERT_PHONE).startsWith("CHANGE_ME")) return;
-    JsonDocument doc;
-    if (deserializeJson(doc, payload)) { Serial.println("[SMS] Telemetry JSON parse error."); return; }
-    JsonObject sensors = doc["sensor_readings"].as<JsonObject>();
-    const float moisture = sensors["soil_moisture_pct"] | 0.0f;
-    const float rainIndex = sensors["rainfall_pct"] | 0.0f;
-    const float tilt = sensors["tilt_angle_deg"] | 0.0f;
-    const uint32_t vibration = sensors["vibration_pulses"] | 0U;
-    const bool critical = (tilt >= 25.0f) || (moisture >= 85.0f && rainIndex >= 75.0f) || (vibration >= 18U && moisture >= 65.0f && rainIndex >= 50.0f);
-    if (!critical) return;
-    const unsigned long now = millis();
-    if (lastDirectSmsAt != 0 && now - lastDirectSmsAt < DIRECT_SMS_COOLDOWN_MS) return;
-    lastDirectSmsAt = now;
-    if (!ensureModemReadyForSMS()) return;
-    String message = "GEOALERT CRITICAL: Node ";
-    message += DEVICE_ID;
-    message += ", soil=" + String(moisture, 1) + "%, rain index=" + String(rainIndex, 1) + "%, tilt=" + String(tilt, 1) + " deg. Verify local conditions and approved safety procedures.";
-    const bool sent = modem.sendSMS(ALERT_PHONE, message);
-    Serial.println(sent ? "[SMS] Direct emergency SMS submitted." : "[SMS] Direct SMS failed.");
+
+
+// ============================================================
+// FIREBASE-QUEUED MULTI-RECIPIENT SMS
+// ============================================================
+
+void processFirebaseSmsQueue() {
+    if (activeConnection == CONN_NONE) return;
+    const String queuePath = String("/nodes/") + DEVICE_ID
+        + "/alerts/queue.json?orderBy=%22%24key%22&limitToLast=20";
+    String response;
+    if (!firebaseReadActive(queuePath, response)) {
+        Serial.println("[SMS Queue] Could not read Firebase queue");
+        return;
+    }
+
+    JsonDocument queueDoc;
+    if (deserializeJson(queueDoc, response)) {
+        Serial.println("[SMS Queue] Queue JSON parse failed");
+        return;
+    }
+    JsonObject queue = queueDoc.as<JsonObject>();
+    if (queue.isNull()) return;
+
+    for (JsonPair entry : queue) {
+        JsonObject item = entry.value().as<JsonObject>();
+        if (item.isNull()) continue;
+        const String status = item["status"] | "";
+        if (status != "queued") continue;
+
+        const String queueId = entry.key().c_str();
+        const String itemPath = String("/nodes/") + DEVICE_ID + "/alerts/queue/" + queueId;
+        const String message = item["message"] | "";
+        JsonArray recipients = item["recipients"].as<JsonArray>();
+        if (message.length() == 0 || recipients.isNull() || recipients.size() == 0) {
+            item["status"] = "failed";
+            item["error"] = "Missing message or recipients; no SMS sent.";
+            item["device_completed_ms"] = millis();
+            String invalidPayload;
+            serializeJson(item, invalidPayload);
+            firebasePutActive(itemPath, invalidPayload);
+            Serial.println("[SMS Queue] Invalid item marked failed");
+            return;
+        }
+
+        // Leave jobs queued if SMS service is temporarily unavailable.
+        if (!ensureModemReadyForSMS()) {
+            Serial.println("[SMS Queue] SIM800L not ready; leaving item queued");
+            return;
+        }
+
+        // Claim before sending to reduce duplicate dispatch on the next poll.
+        item["status"] = "processing";
+        item["device_started_ms"] = millis();
+        item["device_id"] = DEVICE_ID;
+        String claimedPayload;
+        serializeJson(item, claimedPayload);
+        if (!firebasePutActive(itemPath, claimedPayload)) {
+            Serial.println("[SMS Queue] Could not claim item; no SMS sent");
+            return;
+        }
+
+        uint16_t sentCount = 0;
+        uint16_t failedCount = 0;
+        for (JsonVariant recipientValue : recipients) {
+            JsonObject recipient = recipientValue.as<JsonObject>();
+            if (recipient.isNull()) {
+                failedCount++;
+                continue;
+            }
+            const String recipientStatus = recipient["status"] | "queued";
+            if (recipientStatus == "sent") { sentCount++; continue; }
+            if (recipientStatus == "failed") { failedCount++; continue; }
+
+            const String phone = recipient["phone"] | "";
+            const String recipientName = recipient["name"] | "recipient";
+            const bool validPhone = phone.length() >= 9 && phone.startsWith("+");
+            const bool sent = validPhone && modem.sendSMS(phone, message);
+            recipient["status"] = sent ? "sent" : "failed";
+            recipient["device_result_ms"] = millis();
+            if (sent) {
+                sentCount++;
+                Serial.println(String("[SMS Queue] SMS accepted for ") + recipientName);
+            } else {
+                failedCount++;
+                recipient["error"] = "SIM800L command failed or phone format invalid.";
+                Serial.println(String("[SMS Queue] SMS failed for ") + recipientName);
+            }
+
+            String progressPayload;
+            serializeJson(item, progressPayload);
+            if (!firebasePutActive(itemPath, progressPayload)) {
+                Serial.println("[SMS Queue] Recipient result write failed; item remains processing");
+                return;
+            }
+            delay(1200);
+        }
+
+        item["sent_count"] = sentCount;
+        item["failed_count"] = failedCount;
+        item["device_completed_ms"] = millis();
+        if (failedCount == 0 && sentCount > 0) item["status"] = "sent";
+        else if (sentCount > 0) item["status"] = "partial";
+        else item["status"] = "failed";
+
+        String finalPayload;
+        serializeJson(item, finalPayload);
+        const bool saved = firebasePutActive(itemPath, finalPayload);
+        Serial.println(saved
+            ? String("[SMS Queue] Completed ") + queueId + " sent=" + sentCount + " failed=" + failedCount
+            : String("[SMS Queue] Final status write failed for ") + queueId);
+        return;
+    }
 }
 
 // ============================================================
@@ -2145,7 +2334,6 @@ void sendTelemetry() {
             payload
 
         );
-        maybeSendDirectSMS(payload);
 
         return;
 
@@ -2225,7 +2413,6 @@ void sendTelemetry() {
 
     }
 
-    maybeSendDirectSMS(payload);
 }
 // SETUP
 
@@ -2480,6 +2667,11 @@ void setup() {
 // ============================================================
 
 void loop() {
+    if (millis() - lastSmsQueuePoll >= SMS_QUEUE_POLL_MS) {
+        lastSmsQueuePoll = millis();
+        if (ensureNetwork()) processFirebaseSmsQueue();
+    }
+
 
     // --------------------------------------------------------
 
@@ -2534,6 +2726,8 @@ void loop() {
         activeConnection =
 
             CONN_WIFI;
+
+        syncClockWiFi();
 
         idToken = "";
 
