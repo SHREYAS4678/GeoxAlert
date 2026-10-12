@@ -1,30 +1,54 @@
-# GeoAlert architecture and current implementation
+# GeoAlert architecture and data-flow details
 
 ```mermaid
 flowchart LR
-    A["Sensor layer<br/>Capacitive soil moisture<br/>FC-37 rain index<br/>DHT22 · SW-420 · MPU6050"] --> B["ESP32 edge node<br/>Sampling + JSON telemetry"]
-    B --> C["Network manager<br/>Wi-Fi primary<br/>SIM800L GPRS fallback"]
-    B <--> D["LittleFS offline spool<br/>Store during outage<br/>Replay after reconnect"]
-    C --> E[("Firebase Realtime Database<br/>nodes/<node_id>/live<br/>nodes/<node_id>/history")]
-    E --> F["Streamlit Command Hub"]
-    F --> G["Visualization / analytics<br/>Risk score · FoS<br/>Forecast · anomaly checks<br/>Node health · report exports"]
-    B -. "optional direct SMS<br/>disabled by default" .-> H["SIM800L SMS"]
+    A["Sensors<br/>Moisture · FC-37 rain index<br/>DHT22 · SW-420 · MPU6050"] -->|5 s sampling| B["ESP32 telemetry builder<br/>pitch + roll → slope tilt"]
+    B --> C["Wi-Fi → SIM800L GPRS fallback"]
+    B <--> D["LittleFS spool / replay"]
+    C --> E[("Firebase Realtime Database<br/>live + history + contacts + queue")]
+    E --> F["Streamlit dashboard"]
+    F --> G["ML inference<br/>Random Forest / XGBoost / voting ensemble"]
+    F --> H["Recipient registration<br/>name + E.164 phone"]
+    F --> I["Risk escalation<br/>HIGH RISK / CRITICAL queue"]
+    H --> E
+    I --> E
+    E --> J["ESP32 polls queue"]
+    J --> K["SIM800L sends messages sequentially"]
+    K --> E
 ```
 
-## Data path
+## Firebase paths
 
-1. Sensors are sampled by the ESP32 and assembled into a JSON telemetry object.
-2. Wi-Fi is the preferred uplink. SIM800L GPRS is the fallback. If both uplinks fail, telemetry is written to LittleFS and replayed after reconnection.
-3. Live data is written to `/nodes/<node_id>/live`; historical records are written to `/nodes/<node_id>/history`.
-4. The Streamlit dashboard reads Firebase and presents live sensor values, node health, weighted hazard score, infinite-slope Factor of Safety, history, forecasts, anomaly indicators, map/fleet views and downloadable reports.
-5. Webhook escalation notifications are optional and only work when a webhook URL is configured. Direct SIM800L SMS is an optional firmware-side feature and is disabled by default.
+- `/nodes/<node_id>/live`: latest telemetry JSON.
+- `/nodes/<node_id>/history`: push-keyed telemetry samples.
+- `/nodes/<node_id>/contacts/<contact_key>`: contact name, phone, active flag and creation time.
+- `/nodes/<node_id>/alerts/queue/<queue_key>`: message, tier, recipient snapshots, queue status, per-recipient delivery statuses.
 
-The repository does not include a cloud SMS worker or a dashboard SMS queue. No physical siren or relay is installed.
+## Pitch / roll / slope-tilt consistency
 
-## Live-versus-demo behavior
+The ESP32 and dashboard use:
 
-The dashboard displays `LIVE STREAMING` only when a Firebase live record is returned for the selected node. If the node path is empty or inaccessible, inspect the serial monitor, Firebase Authentication, Realtime Database rules, database URL and firmware's configured node ID. Historical graphs may use synthetic fallback data when no device history is available.
+`tilt_deg = degrees(acos(clamp(cos(radians(pitch)) * cos(radians(roll)), -1, 1)))`
 
-## Current analytical limitations
+This makes Slope Tilt a combined inclination derived from pitch and roll rather than an independent measurement. Yaw is available for model input/visualization but does not contribute to this tilt magnitude.
 
-The displayed hazard tier is based on a weighted heuristic and an infinite-slope FoS calculation. The separate training pipeline's supplied binary model is not wired into the live hazard tier. Its metrics should not be interpreted as validated field performance.
+The ESP32 uses NTP time over Wi-Fi when available and publishes Unix milliseconds. If wall-clock synchronization is unavailable, it marks the timestamp as uptime; the dashboard ignores uptime-only historical times instead of fabricating calendar dates.
+
+## Alert lifecycle
+
+1. An operator enters recipient name and international-format phone number in the Streamlit dashboard. The contact is saved in Firebase.
+2. Manual dispatch can queue a message for all active contacts. If the dashboard's automatic SMS option is enabled, a live escalation to HIGH RISK or CRITICAL also creates a queue item.
+3. The ESP32 polls the latest queue items approximately every 10 seconds over the active Firebase connection. It leaves jobs queued if the SIM800L isn't ready, otherwise marks one item `processing`.
+4. It sends sequentially through SIM800L and writes each result plus a final `sent`, `partial`, or `failed` state.
+5. A job that remains `processing` is not silently resent because some recipients may already have received it. Check individual status and use a new job for a deliberate retry.
+
+## Machine learning
+
+The dashboard loads `models/voting_ensemble_model.pkl` and shows binary prediction/probabilities plus held-out metrics from `reports/training_report.json`. The supplied dataset doesn't document class meanings or confirmed rainfall units, so the ML output is informational and cannot independently trigger SMS. The live risk tier remains the transparent weighted sensor / infinite-slope Factor-of-Safety heuristic.
+
+## Limitations
+
+- The example Firebase rules are a prototype baseline. Tighten access to per-user/per-device permissions before broader deployment.
+- Firebase connectivity is required for the ESP32 to read and update the SMS queue. If cellular data is down, queued jobs wait until database connectivity returns.
+- SIM800L SMS delivery requires suitable power, a ready SIM and network SMS support. A successful modem command is not a guaranteed proof of handset delivery.
+- This system is not certified for use as the sole basis of emergency action.
