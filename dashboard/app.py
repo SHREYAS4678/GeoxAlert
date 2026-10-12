@@ -25,6 +25,7 @@ import time
 import zipfile
 import zlib
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -32,6 +33,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import requests
+import joblib
 import streamlit as st
 from plotly.subplots import make_subplots
 
@@ -75,6 +77,11 @@ st.markdown(
 # ==============================================================================
 DEFAULT_DB_URL = "https://geoalert-ai-ee1fd-default-rtdb.asia-southeast1.firebasedatabase.app"
 DEFAULT_NODE = "geoalert-node-01"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ML_MODEL_PATH = PROJECT_ROOT / "models" / "voting_ensemble_model.pkl"
+ML_REPORT_PATH = PROJECT_ROOT / "reports" / "training_report.json"
+ML_FEATURES = ["soil_moisture", "rainfall", "temperature", "humidity",
+               "roll", "pitch", "yaw", "vibration"]
 
 
 def _secret(key: str) -> str:
@@ -190,6 +197,11 @@ with st.sidebar:
         WEBHOOK = WEBHOOK_SECRET or st.text_input("Webhook URL (Slack/Discord/custom)", type="password")
         NOTIFY_MIN = {"WARNING": 1, "HIGH RISK": 2, "CRITICAL": 3}[st.selectbox("Notify from tier", ["WARNING", "HIGH RISK", "CRITICAL"], index=1)]
         NOTIFY_COOLDOWN = st.slider("Reminder cooldown (min)", 1, 60, 10)
+        AUTO_SMS = st.checkbox(
+            "Queue SIM800L SMS for HIGH RISK / CRITICAL",
+            value=False,
+            help="Requires active Firebase recipients and queue-polling firmware. Queues only on live escalation.",
+        )
     with st.expander("🗺️ Site coordinates"):
         st.caption("Used for nodes without `nodes/<id>/meta {lat, lon}` (demo positions are offset around this point).")
         BASE_LAT = st.number_input("Latitude", -90.0, 90.0, 13.0, 0.001, format="%.4f")
@@ -213,7 +225,7 @@ PROTOCOL = {
     "WARNING": ["Increase sampling frequency and watch trend slopes.", "Notify the field engineer on duty.",
                 "Inspect drainage channels upslope."],
     "HIGH RISK": ["Alert the local disaster-management authority.", "Pre-position response teams; restrict access to the runout zone.",
-                  "Prepare the SMS broadcast to registered residents."],
+                  "Prepare the configured notification for registered contacts."],
     "CRITICAL": ["Dispatch configured emergency SMS/voice alerts and follow the approved evacuation protocol.", "Evacuate lower runoff valleys and close roads below the slope.",
                  "Escalate to the district emergency operations centre."],
 }
@@ -355,8 +367,54 @@ def log_event(level: str, message: str):
 
 
 # ==============================================================================
-# 5. DATA PARSING, HISTORY, FLEET, HEALTH
+# 5. SENSOR DERIVATION, ML INFERENCE, DATA PARSING, HISTORY, FLEET, HEALTH
 # ==============================================================================
+def resultant_tilt_deg(pitch, roll):
+    """Combined gravity tilt computed from both MPU6050 orientation angles."""
+    pitch_rad = np.deg2rad(np.asarray(pitch, dtype=float))
+    roll_rad = np.deg2rad(np.asarray(roll, dtype=float))
+    value = np.rad2deg(np.arccos(np.clip(np.cos(pitch_rad) * np.cos(roll_rad), -1.0, 1.0)))
+    return float(value) if np.ndim(value) == 0 else value
+
+
+@st.cache_resource
+def load_geoalert_model():
+    try:
+        model = joblib.load(ML_MODEL_PATH) if ML_MODEL_PATH.exists() else None
+        report = json.loads(ML_REPORT_PATH.read_text(encoding="utf-8")) if ML_REPORT_PATH.exists() else None
+        return model, report, None
+    except Exception as err:
+        return None, None, f"{type(err).__name__}: {err}"
+
+
+def infer_ml(sensors):
+    """Experimental binary output; label meaning and live rainfall units must be validated."""
+    model, report, error = load_geoalert_model()
+    if model is None:
+        return {"available": False, "error": error or "Trained model not found", "report": report}
+    row = {
+        "soil_moisture": sensors["soil_moisture_pct"],
+        "rainfall": sensors["rainfall_pct"],
+        "temperature": sensors["temperature_c"],
+        "humidity": sensors["humidity_pct"],
+        "roll": sensors["roll_deg"],
+        "pitch": sensors["pitch_deg"],
+        "yaw": sensors["yaw_deg"],
+        "vibration": sensors["vibration_pulses"],
+    }
+    try:
+        X = pd.DataFrame([[row[name] for name in ML_FEATURES]], columns=ML_FEATURES)
+        prediction = int(model.predict(X)[0])
+        probabilities = model.predict_proba(X)[0]
+        classes = list(model.classes_)
+        distribution = {f"Label {int(c)}": float(p) for c, p in zip(classes, probabilities)}
+        return {"available": True, "prediction": prediction, "confidence": float(max(probabilities)),
+                "probabilities": distribution, "input": row, "report": report,
+                "note": "Experimental only; class meanings and rainfall units are not confirmed."}
+    except Exception as err:
+        return {"available": False, "error": f"{type(err).__name__}: {err}", "report": report}
+
+
 def _f(v, default=0.0):
     try:
         return float(v)
@@ -366,16 +424,28 @@ def _f(v, default=0.0):
 
 def parse_live(live):
     if not live:
-        s = {"soil_moisture_pct": 68.4, "rainfall_pct": 54.0, "temperature_c": 23.5, "humidity_pct": 89.0,
-             "tilt_angle_deg": 12.8, "pitch_deg": 11.4, "roll_deg": 5.8, "yaw_deg": 1.2, "vibration_pulses": 4}
+        s = {"soil_moisture_pct": 68.4, "rainfall_pct": 54.0, "temperature_c": 23.5,
+             "humidity_pct": 89.0, "pitch_deg": 11.4, "roll_deg": 5.8,
+             "yaw_deg": 1.2, "vibration_pulses": 4}
+        s["tilt_angle_deg"] = resultant_tilt_deg(s["pitch_deg"], s["roll_deg"])
         return s, {"active_interface": "DEMO / RECONNECTING", "rssi": -68}, False, {}
     raw = live.get("sensor_readings", live)
     mpu = raw.get("mpu_raw", {}) or {}
-    s = {"soil_moisture_pct": _f(raw.get("soil_moisture_pct")), "rainfall_pct": _f(raw.get("rainfall_pct")),
-         "temperature_c": _f(raw.get("temperature_c")), "humidity_pct": _f(raw.get("humidity_pct")),
-         "tilt_angle_deg": _f(raw.get("tilt_angle_deg")),
-         "pitch_deg": _f(mpu.get("pitch_deg", raw.get("pitch_deg"))), "roll_deg": _f(mpu.get("roll_deg", raw.get("roll_deg"))),
-         "yaw_deg": _f(mpu.get("yaw_deg", raw.get("yaw_deg"))), "vibration_pulses": int(_f(raw.get("vibration_pulses")))}
+    pitch = _f(mpu.get("pitch_deg", raw.get("pitch_deg")))
+    roll = _f(mpu.get("roll_deg", raw.get("roll_deg")))
+    has_orientation = (("pitch_deg" in mpu or "pitch_deg" in raw) and
+                       ("roll_deg" in mpu or "roll_deg" in raw))
+    tilt = resultant_tilt_deg(pitch, roll) if has_orientation else _f(raw.get("tilt_angle_deg"))
+    s = {
+        "soil_moisture_pct": _f(raw.get("soil_moisture_pct")),
+        "rainfall_pct": _f(raw.get("rainfall_pct")),
+        "temperature_c": _f(raw.get("temperature_c")),
+        "humidity_pct": _f(raw.get("humidity_pct")),
+        "tilt_angle_deg": tilt,
+        "pitch_deg": pitch, "roll_deg": roll,
+        "yaw_deg": _f(mpu.get("yaw_deg", raw.get("yaw_deg"))),
+        "vibration_pulses": int(_f(raw.get("vibration_pulses"))),
+    }
     power = live.get("power", {}) or {}
     extras = {}
     for k in ("battery_v", "battery_voltage", "battery_pct", "solar_v", "solar_voltage", "uptime_s"):
@@ -384,7 +454,6 @@ def parse_live(live):
                 extras[k] = _f(src[k])
                 break
     return s, live.get("network_status", {"active_interface": "Wi-Fi (Online)", "rssi": -62}), True, extras
-
 
 def normalize_history(raw, sensors):
     """Firebase push-id dict -> tidy, time-sorted DataFrame (or None)."""
@@ -412,6 +481,8 @@ def normalize_history(raw, sensors):
     for c in SENSOR_COLS:
         df[c] = pd.to_numeric(df[c], errors="coerce") if c in df.columns else sensors[c]
         df[c] = df[c].ffill().bfill().fillna(sensors[c])
+    if "pitch_deg" in df.columns and "roll_deg" in df.columns:
+        df["tilt_angle_deg"] = resultant_tilt_deg(df["pitch_deg"], df["roll_deg"])
     df = df.dropna(subset=["timestamp"]).sort_values("timestamp").tail(500).reset_index(drop=True)
     return df[["timestamp"] + SENSOR_COLS] if len(df) else None
 
@@ -820,11 +891,73 @@ def build_context():
         S.p_fos = float((f.min(axis=1) < 1).mean())
     S.rel = reliability(s["tilt_angle_deg"], s["soil_moisture_pct"], SOIL, CV)
     S.health = node_health(df_raw, S.hist_is_real, s, S.extras, S.network, S.is_live)
+    S.ml = infer_ml(s)
     S.fleet, S.fleet_demo = get_fleet(s, S.network, S.is_live)
     S.source = "live Firebase stream" if S.is_live else "demo data"
     S.narrative = make_narrative(S)
     S.stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     return S
+
+
+def get_contacts(active_only=False):
+    data = fb_get(f"nodes/{NODE_ID}/contacts")
+    contacts = data if isinstance(data, dict) else {}
+    clean = {}
+    for key, item in contacts.items():
+        if not isinstance(item, dict):
+            continue
+        name, phone = str(item.get("name", "")).strip(), str(item.get("phone", "")).strip()
+        if name and phone:
+            clean[key] = {**item, "name": name, "phone": phone, "active": bool(item.get("active", True))}
+    return {k: v for k, v in clean.items() if v["active"]} if active_only else clean
+
+
+def create_sms_queue_item(S, contacts, origin="manual"):
+    recipients = [{"contact_id": key, "name": v["name"], "phone": v["phone"], "status": "queued"}
+                  for key, v in contacts.items() if v.get("active", True)]
+    if not recipients:
+        return False, "No active recipients are registered.", None
+    if not S.is_live:
+        return False, "No live Firebase telemetry/connection. Alert was not queued.", None
+    payload = {
+        "node_id": NODE_ID, "origin": origin, "status": "queued", "tier": S.tier["name"],
+        "threat_score": round(S.score, 1), "factor_of_safety": round(S.fos, 2),
+        "message": (f"GEOALERT {S.tier['name']} | Node {NODE_ID} | Threat {S.score:.0f}/100 | "
+                    f"Slope tilt {S.sensors['tilt_angle_deg']:.1f} deg | "
+                    f"Soil moisture {S.sensors['soil_moisture_pct']:.1f}% | "
+                    f"Rain index {S.sensors['rainfall_pct']:.1f}%. "
+                    "Verify local conditions and follow approved safety procedures."),
+        "recipients": recipients, "recipient_count": len(recipients),
+        "created_at_utc": datetime.now(timezone.utc).isoformat(), "created_epoch": int(time.time()),
+    }
+    ok, msg, key = fb_write(f"nodes/{NODE_ID}/alerts/queue", payload, push=True)
+    if ok:
+        log_event("SMS QUEUED", f"{S.tier['name']} alert queued for {len(recipients)} SIM800L recipient(s); queue ID {key or 'created'}.")
+    else:
+        log_event("ERROR", f"Could not queue SIM800L alert: {msg}")
+    return ok, msg, key
+
+
+def maybe_auto_queue_sms(S):
+    state_key = f"auto_sms_previous_level::{NODE_ID}"
+    current = int(S.tier["level"])
+    previous = int(st.session_state.get(state_key, 0))
+    if current < 2:
+        st.session_state[state_key] = current
+        return
+    if not AUTO_SMS or not S.is_live or current <= previous:
+        return
+    contacts = get_contacts(active_only=True)
+    if not contacts:
+        notice_key = f"auto_sms_no_contacts_notice::{NODE_ID}"
+        if st.session_state.get(notice_key) != current:
+            log_event("WARNING", "Automatic SMS is armed, but no active recipients are registered.")
+            st.session_state[notice_key] = current
+        return
+    ok, msg, _ = create_sms_queue_item(S, contacts, origin="automatic-risk-escalation")
+    st.session_state[state_key] = current
+    if not ok:
+        log_event("WARNING", f"Automatic SMS not queued: {msg}")
 
 
 def log_and_notify(S):
@@ -853,6 +986,7 @@ def log_and_notify(S):
         except Exception as err:
             log_event("ERROR", f"Webhook failed: {err}")
         last["level"], last["ts"] = S.tier["level"], time.time()
+    maybe_auto_queue_sms(S)
 
 
 # ==============================================================================
@@ -1328,123 +1462,237 @@ def tab_health(S):
 
 
 def architecture_figure():
-    """Plotly architecture diagram; no additional visualization dependency needed."""
+    """Interactive diagram showing sensor, telemetry, ML and alert paths."""
     fig = go.Figure()
     nodes = [
-        {"x0": 0.15, "x1": 2.15, "y0": 2.55, "y1": 3.90, "title": "Sensor layer",
-         "body": "Soil moisture • FC-37<br>DHT22 • SW-420 • MPU6050", "color": "#38BDF8"},
-        {"x0": 2.55, "x1": 4.55, "y0": 2.55, "y1": 3.90, "title": "ESP32 edge",
-         "body": "Read sensors • validate<br>Create telemetry JSON", "color": "#818CF8"},
-        {"x0": 4.95, "x1": 6.95, "y0": 2.55, "y1": 3.90, "title": "Network uplink",
+        {"x0": 0.1, "x1": 2.1, "y0": 2.8, "y1": 4.1, "title": "SENSOR LAYER",
+         "body": "Moisture • FC-37 rain<br>DHT22 • SW-420 • MPU6050", "color": "#38BDF8"},
+        {"x0": 2.5, "x1": 4.5, "y0": 2.8, "y1": 4.1, "title": "ESP32 EDGE NODE",
+         "body": "Every 5 seconds<br>Pitch + roll → tilt • JSON", "color": "#818CF8"},
+        {"x0": 4.9, "x1": 6.9, "y0": 2.8, "y1": 4.1, "title": "NETWORK FAILOVER",
          "body": "Wi-Fi primary<br>SIM800L GPRS fallback", "color": "#34D399"},
-        {"x0": 7.35, "x1": 9.35, "y0": 2.55, "y1": 3.90, "title": "Firebase RTDB",
-         "body": "/nodes/{id}/live<br>/nodes/{id}/history", "color": "#FBBF24"},
-        {"x0": 9.75, "x1": 11.85, "y0": 2.55, "y1": 3.90, "title": "Streamlit Hub",
-         "body": "Risk score • FoS<br>Forecasts • health • exports", "color": "#F472B6"},
-        {"x0": 2.65, "x1": 4.45, "y0": 0.45, "y1": 1.50, "title": "LittleFS offline queue",
-         "body": "Store locally if both links fail", "color": "#94A3B8"},
+        {"x0": 7.3, "x1": 9.3, "y0": 2.8, "y1": 4.1, "title": "FIREBASE RTDB",
+         "body": "Live + history<br>Contacts + SMS queue", "color": "#FBBF24"},
+        {"x0": 9.7, "x1": 11.8, "y0": 2.8, "y1": 4.1, "title": "STREAMLIT HUB",
+         "body": "Live cards • ML • FoS<br>Risk • analytics • reports", "color": "#F472B6"},
+        {"x0": 2.55, "x1": 4.45, "y0": 0.55, "y1": 1.65, "title": "LITTLEFS SPOOL",
+         "body": "Buffer during outages<br>Replay after reconnect", "color": "#94A3B8"},
+        {"x0": 7.15, "x1": 9.45, "y0": 0.55, "y1": 1.65, "title": "CLOUD RECIPIENTS",
+         "body": "Names + E.164 phone<br>Active contacts", "color": "#FBBF24"},
+        {"x0": 9.75, "x1": 11.8, "y0": 0.55, "y1": 1.65, "title": "SIM800L SMS",
+         "body": "Poll queue • send in order<br>Update each delivery status", "color": "#FB7185"},
     ]
-    connectors = [
-        (2.15, 3.22, 2.55, 3.22), (4.55, 3.22, 4.95, 3.22),
-        (6.95, 3.22, 7.35, 3.22), (9.35, 3.22, 9.75, 3.22),
-        (3.15, 2.55, 3.15, 1.50), (3.95, 1.50, 3.95, 2.55),
+    arrows = [
+        (2.1, 3.45, 2.5, 3.45), (4.5, 3.45, 4.9, 3.45), (6.9, 3.45, 7.3, 3.45),
+        (9.3, 3.45, 9.7, 3.45), (3.1, 2.8, 3.1, 1.65), (4.0, 1.65, 4.0, 2.8),
+        (8.2, 2.8, 8.2, 1.65), (9.45, 1.1, 9.75, 1.1), (10.75, 1.65, 10.75, 2.8),
     ]
-    for x0, y0, x1, y1 in connectors:
-        fig.add_annotation(
-            x=x1, y=y1, ax=x0, ay=y0, xref="x", yref="y", axref="x", ayref="y",
-            text="", showarrow=True, arrowhead=2, arrowsize=1.1,
-            arrowwidth=2, arrowcolor="#94A3B8",
-        )
-    for n in nodes:
-        fig.add_shape(
-            type="rect", x0=n["x0"], x1=n["x1"], y0=n["y0"], y1=n["y1"],
-            line={"color": n["color"], "width": 2},
-            fillcolor="rgba(15,23,42,0.96)", layer="below",
-        )
-        cx, cy = (n["x0"] + n["x1"]) / 2, (n["y0"] + n["y1"]) / 2
-        fig.add_annotation(
-            x=cx, y=cy + 0.20, text=f"<b>{n['title']}</b>", showarrow=False,
-            font={"size": 12, "color": n["color"]}, xanchor="center", yanchor="middle",
-        )
-        fig.add_annotation(
-            x=cx, y=cy - 0.19, text=n["body"], showarrow=False,
-            font={"size": 10, "color": "#E2E8F0"}, xanchor="center", yanchor="middle",
-        )
-    fig.add_annotation(x=4.50, y=1.98, text="buffer / replay", showarrow=False,
-                       font={"size": 9, "color": "#94A3B8"}, xanchor="left")
-    fig.update_layout(
-        height=455, margin={"l": 5, "r": 5, "t": 8, "b": 8},
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        font={"color": "#E2E8F0"}, showlegend=False,
-    )
-    fig.update_xaxes(visible=False, range=[0, 12.0], fixedrange=True)
-    fig.update_yaxes(visible=False, range=[0.1, 4.25], fixedrange=True)
+    for x0, y0, x1, y1 in arrows:
+        fig.add_annotation(x=x1, y=y1, ax=x0, ay=y0, xref="x", yref="y", axref="x", ayref="y",
+                           text="", showarrow=True, arrowhead=2, arrowsize=1.0, arrowwidth=2, arrowcolor="#64748B")
+    for node in nodes:
+        fig.add_shape(type="rect", x0=node["x0"], x1=node["x1"], y0=node["y0"], y1=node["y1"],
+                      line={"color": node["color"], "width": 2}, fillcolor="rgba(15,23,42,0.96)", layer="below")
+        cx, cy = (node["x0"] + node["x1"]) / 2, (node["y0"] + node["y1"]) / 2
+        fig.add_annotation(x=cx, y=cy + 0.17, text=f"<b>{node['title']}</b>", showarrow=False,
+                           font={"size": 11, "color": node["color"]}, xanchor="center", yanchor="middle")
+        fig.add_annotation(x=cx, y=cy - 0.20, text=node["body"], showarrow=False,
+                           font={"size": 9, "color": "#E2E8F0"}, xanchor="center", yanchor="middle")
+    fig.update_layout(height=500, margin={"l": 8, "r": 8, "t": 12, "b": 12},
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", showlegend=False)
+    fig.update_xaxes(visible=False, range=[0, 12], fixedrange=True)
+    fig.update_yaxes(visible=False, range=[0.2, 4.45], fixedrange=True)
     return fig
 
 
 def tab_architecture(S):
-    st.subheader("GeoAlert system architecture")
-    st.caption("End-to-end sensor data path for the selected node.")
+    st.subheader("System architecture & live data flow")
+    st.caption("Sensor acquisition → ESP32 edge processing → Firebase → Streamlit / SIM800L SMS queue.")
     st.plotly_chart(architecture_figure(), **WIDE, key="architecture_diagram")
     m = st.columns(4)
-    m[0].metric("Telemetry", "LIVE" if S.is_live else "OFFLINE / DEMO")
-    m[1].metric("Node ID", NODE_ID)
-    m[2].metric("Active uplink", str(S.network.get("active_interface", "Unknown")))
-    m[3].metric("History source", "Firebase" if S.hist_is_real else "Synthetic fallback")
+    m[0].metric("Sampling target", "5 seconds")
+    m[1].metric("Telemetry", "LIVE" if S.is_live else "OFFLINE / DEMO")
+    m[2].metric("Network", str(S.network.get("active_interface", "Unknown")))
+    m[3].metric("Slope tilt", f"{S.sensors['tilt_angle_deg']:.2f}°")
+    st.markdown("#### Runtime responsibilities")
+    st.markdown("""
+- **Sensors → ESP32:** moisture, rain index, temperature/humidity, vibration counts and MPU6050 orientation sampled every five seconds.
+- **Consistent tilt:** firmware and dashboard derive slope tilt from both pitch and roll using the same formula.
+- **Firebase:** /nodes/<node_id>/live, /history, /contacts and /alerts/queue.
+- **Machine learning:** Streamlit loads the trained soft-voting binary model and displays a prediction with probabilities, plus dataset holdout metrics.
+- **SMS:** the dashboard snapshots active contacts into one queue item. ESP32 polls the queue, sends through SIM800L in recipient order, and writes individual/final statuses.
+- **Offline buffering:** telemetry is held in LittleFS during dual-link outages; queue jobs wait until Firebase is reachable again.
+""")
+    st.warning("A queued message is not proof of delivery. Test with consenting phone numbers and verify queue statuses. There is no physical siren or relay.")
 
-    st.markdown("#### Data flow")
-    st.markdown(
-        """
-1. **Sensors → ESP32:** Soil moisture, rain index, temperature, humidity, vibration and IMU readings are sampled and packaged as JSON.
 
-2. **ESP32 → network:** Wi-Fi is attempted first; SIM800L GPRS is the fallback. If both links fail, telemetry is buffered in LittleFS and replayed after reconnection.
+def _ml_metrics_table(report):
+    models = report.get("evaluation", {}).get("models", []) if isinstance(report, dict) else []
+    if not models:
+        return None
+    return pd.DataFrame([{
+        "Model": item.get("model", "Unknown"),
+        "Accuracy (%)": round(float(item.get("accuracy", 0)) * 100, 2),
+        "Macro F1 (%)": round(float(item.get("f1_macro", 0)) * 100, 2),
+        "ROC-AUC": round(float(item.get("roc_auc", float("nan"))), 4),
+    } for item in models])
 
-3. **Firebase Realtime Database:** Live readings are written to `/nodes/<node_id>/live`; historical samples are written to `/nodes/<node_id>/history`.
 
-4. **Streamlit Command Hub:** Reads Firebase data and visualizes sensor status, hazard score, infinite-slope Factor of Safety, history, forecasts, anomalies and reports.
-"""
+def tab_ml(S):
+    st.subheader("Machine-learning diagnostics")
+    ml = S.ml
+    if ml.get("available"):
+        cols = st.columns(3)
+        cols[0].metric("Predicted dataset label", f"Label {ml['prediction']}")
+        cols[1].metric("Model confidence", f"{ml['confidence'] * 100:.1f}%")
+        cols[2].metric("Model", "Soft-voting ensemble")
+        probabilities = pd.DataFrame({
+            "Class": list(ml["probabilities"].keys()),
+            "Probability (%)": [v * 100 for v in ml["probabilities"].values()],
+        })
+        st.plotly_chart(px.bar(probabilities, x="Class", y="Probability (%)", text_auto=".1f",
+                                title="Experimental class probabilities"),
+                        **WIDE, key="ml_probabilities")
+    else:
+        st.warning("No live ML prediction is available. " + str(ml.get("error", "Trained model not found.")))
+    report = ml.get("report")
+    metrics = _ml_metrics_table(report)
+    if metrics is not None:
+        st.markdown("#### Held-out dataset evaluation")
+        st.dataframe(metrics, use_container_width=True, hide_index=True)
+        st.caption(f"Test split: {report.get('evaluation', {}).get('rows_test', 'n/a')} samples from {report.get('rows_used', 'n/a')} usable rows.")
+    st.warning(
+        "The supplied CSV does not define whether Label 0 or Label 1 means landslide risk. Its rainfall units also need calibration to the FC-37 live rain index. "
+        "These holdout scores are not proof of 90–99% field accuracy. ML output is informational and does not independently trigger SMS."
     )
-    st.info(
-        "This version has no cloud SMS worker and no physical siren/relay. "
-        "Direct SIM800L SMS is an optional firmware-side feature and is disabled by default; "
-        "webhook notifications can be configured separately."
-    )
+    st.code("soil_moisture, rainfall, temperature, humidity, roll, pitch, yaw, vibration", language="text")
 
 
 def tab_response(S):
-    st.subheader("Alerts & event log")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("#### Current assessment")
-        st.metric("Hazard tier", S.tier["name"])
-        st.metric("Threat score", f"{S.score:.1f}/100")
-        st.metric("Factor of Safety", f"{S.fos:.2f}")
-    with col2:
-        st.markdown("#### Notification configuration")
-        if NOTIFY_ON and WEBHOOK:
-            st.success("Webhook escalation notifications are enabled.")
-        else:
-            st.caption("Webhook escalation notifications are off. Configure them from the sidebar if needed.")
-        st.info(
-            "This dashboard records and displays events; it does not dispatch SMS. "
-            "Optional direct SIM800L SMS is configured in the firmware and is disabled by default. "
-            "No physical siren or relay is installed."
-        )
+    st.subheader("Recipients & SIM800L alert queue")
+    st.caption("Contact records live in Firebase. The ESP32/SIM800L consumes queued jobs and records per-recipient delivery status.")
+    contacts_path = f"nodes/{NODE_ID}/contacts"
+    queue_path = f"nodes/{NODE_ID}/alerts/queue"
+    with st.expander("➕ Register a recipient", expanded=True):
+        with st.form(f"contact_add_{NODE_ID}", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            name = c1.text_input("Recipient name", placeholder="e.g. Site supervisor")
+            phone = c2.text_input("Phone number (international format)", placeholder="+919876543210")
+            submitted = st.form_submit_button("Save recipient to Firebase", type="primary")
+        if submitted:
+            if not name.strip():
+                st.error("Enter a recipient name.")
+            elif not re.fullmatch(r"\+[1-9]\d{7,14}", phone.strip()):
+                st.error("Use international format such as +919876543210.")
+            else:
+                ok, msg, key = fb_write(contacts_path, {
+                    "name": name.strip(), "phone": phone.strip(), "active": True,
+                    "created_at_utc": datetime.now(timezone.utc).isoformat(),
+                }, push=True)
+                (st.success if ok else st.error)(msg)
+                if ok:
+                    st.rerun()
 
+    contacts = get_contacts(active_only=False)
+    if contacts:
+        st.markdown(f"#### Registered recipients ({sum(1 for c in contacts.values() if c.get('active', True))} active)")
+        for key, contact in contacts.items():
+            with st.container(border=True):
+                left, middle, right = st.columns([2.2, 2.0, 1.2])
+                with left:
+                    st.write(f"**{contact['name']}**")
+                    st.caption(contact["phone"])
+                with middle:
+                    active = st.checkbox("Active for alerts", value=contact.get("active", True),
+                                         key=f"contact_active_{NODE_ID}_{key}")
+                    if active != contact.get("active", True):
+                        ok, msg, _ = fb_write(f"{contacts_path}/{key}", {**contact, "active": active})
+                        if not ok:
+                            st.error(msg)
+                        else:
+                            st.rerun()
+                with right:
+                    if st.button("Remove", key=f"contact_remove_{NODE_ID}_{key}"):
+                        ok, msg = fb_delete(f"{contacts_path}/{key}")
+                        (st.success if ok else st.error)(msg)
+                        if ok:
+                            st.rerun()
+    else:
+        st.info("No recipients saved yet. Add names and international-format phone numbers above.")
+
+    st.divider()
+    st.markdown("#### Dispatch")
+    st.write(f"Current assessment: **{S.tier['name']}** · threat **{S.score:.1f}/100** · FoS **{S.fos:.2f}**.")
+    active_contacts = get_contacts(active_only=True)
+    st.caption(f"{len(active_contacts)} active recipients will be included.")
+    message = st.text_area(
+        "Message to send to active recipients",
+        value=(f"GEOALERT {S.tier['name']} | Node {NODE_ID} | Threat {S.score:.0f}/100 | "
+               f"Tilt {S.sensors['tilt_angle_deg']:.1f} deg | Soil {S.sensors['soil_moisture_pct']:.1f}% | "
+               f"Rain index {S.sensors['rainfall_pct']:.1f}%. Verify conditions and follow approved safety procedures."),
+        max_chars=400, key="manual_sms_message",
+    )
+    confirm = st.checkbox("I authorize sending this message to all active recipients.", key="sms_broadcast_confirm")
+    if st.button("📤 Queue SMS to active recipients", type="primary",
+                 disabled=not (confirm and active_contacts), key="queue_sim800_sms"):
+        if not S.is_live:
+            st.error("No live Firebase connection; message was not queued.")
+        else:
+            payload = {
+                "node_id": NODE_ID, "origin": "manual-dashboard", "status": "queued",
+                "tier": S.tier["name"], "threat_score": round(S.score, 1), "factor_of_safety": round(S.fos, 2),
+                "message": message.strip(),
+                "recipients": [{"contact_id": key, "name": c["name"], "phone": c["phone"], "status": "queued"}
+                               for key, c in active_contacts.items()],
+                "recipient_count": len(active_contacts),
+                "created_at_utc": datetime.now(timezone.utc).isoformat(), "created_epoch": int(time.time()),
+            }
+            ok, msg, key = fb_write(queue_path, payload, push=True)
+            (st.success if ok else st.error)(f"{msg} Queue ID: {key or 'n/a'}")
+            if ok:
+                log_event("SMS QUEUED", f"Manual {S.tier['name']} message queued for {len(active_contacts)} recipients.")
+                st.rerun()
+
+    st.markdown("#### Queue status")
+    queue = fb_get(queue_path, {"orderBy": '"$key"', "limitToLast": 30})
+    if isinstance(queue, dict) and queue:
+        rows = []
+        for key, item in queue.items():
+            if not isinstance(item, dict):
+                continue
+            recipients = item.get("recipients", [])
+            sent = sum(1 for r in recipients if isinstance(r, dict) and r.get("status") == "sent") if isinstance(recipients, list) else 0
+            failed = sum(1 for r in recipients if isinstance(r, dict) and r.get("status") == "failed") if isinstance(recipients, list) else 0
+            rows.append({"Queue ID": key, "Created": item.get("created_at_utc", ""), "Tier": item.get("tier", ""),
+                         "Status": item.get("status", "unknown"),
+                         "Recipients": item.get("recipient_count", len(recipients) if isinstance(recipients, list) else 0),
+                         "Sent": sent, "Failed": failed})
+        if rows:
+            show_df(pd.DataFrame(rows).sort_values("Created", ascending=False))
+    elif queue is None:
+        st.caption("Queue is unavailable; check Firebase authentication and rules.")
+    else:
+        st.caption("No SMS requests are queued yet.")
+
+    st.info(
+        "Automatic queuing is opt-in from the sidebar and runs on live escalations to HIGH RISK/CRITICAL. "
+        "The matching firmware must be uploaded; SIM800L needs adequate power, a ready SIM and SMS service. "
+        "A processing job is not automatically resent to avoid duplicate alerts."
+    )
     st.markdown("#### Session alert log")
     log = st.session_state.alert_log
-    unacked = sum(1 for a in log if not a.get("ack"))
+    unacked = sum(1 for item in log if not item.get("ack"))
     c1, c2 = st.columns([1, 3])
     c1.metric("Unacknowledged", unacked)
     if c2.button("✅ Acknowledge all", key="btn_ack"):
-        for a in log:
-            a["ack"] = True
-        st.rerun(scope="fragment") if NEW_API else None
+        for item in log:
+            item["ack"] = True
+        if NEW_API:
+            st.rerun(scope="fragment")
     if log:
         show_df(pd.DataFrame(log))
     else:
         st.caption("No events yet.")
-
 
 
 def tab_export(S):
@@ -1508,6 +1756,8 @@ def render():
     )
     if st.session_state.get("auth_error"):
         st.warning(f"Firebase authentication failed: {st.session_state['auth_error']}")
+    if st.session_state.get("db_error"):
+        st.caption(f"Firebase operation detail: {st.session_state['db_error']}")
     if S.tier["level"] >= 2:
         acts = "\n".join(f"- {a}" for a in PROTOCOL[S.tier["name"]])
         st.error(f"⚠️ **{S.tier['name']}** - threat **{S.score:.1f}/100**, FoS **{S.fos:.2f}**, probability of failure **{S.rel['pf'] * 100:.1f}%**. "
@@ -1518,19 +1768,26 @@ def render():
     def dl(col, unit=""):
         return f"{s[col] - df[col].iloc[-11]:+.1f}{unit}" if len(df) > 10 else None
 
-    m = st.columns(7)
+    m = st.columns(8)
     m[0].metric("Soil Saturation", f"{s['soil_moisture_pct']:.1f}%", dl("soil_moisture_pct", "%"), delta_color="inverse")
-    m[1].metric("Precipitation", f"{s['rainfall_pct']:.1f}%", dl("rainfall_pct", "%"), delta_color="inverse")
-    m[2].metric("Slope Tilt", f"{s['tilt_angle_deg']:.1f}°", dl("tilt_angle_deg", "°"), delta_color="inverse")
-    m[3].metric("Seismic Tremors", f"{s['vibration_pulses']} /s")
+    m[1].metric("Rain Index", f"{s['rainfall_pct']:.1f}%", dl("rainfall_pct", "%"), delta_color="inverse")
+    m[2].metric("Slope Tilt", f"{s['tilt_angle_deg']:.1f}°", dl("tilt_angle_deg", "°"), delta_color="inverse",
+                help="Derived from both MPU6050 pitch and roll; not an independent sensor reading.")
+    m[3].metric("Vibration", f"{s['vibration_pulses']} pulses")
     m[4].metric("Temperature", f"{s['temperature_c']:.1f} °C")
-    m[5].metric("Air Humidity", f"{s['humidity_pct']:.0f}%")
+    m[5].metric("Humidity", f"{s['humidity_pct']:.0f}%")
     m[6].metric("Pitch / Roll", f"{s['pitch_deg']:.1f}° / {s['roll_deg']:.1f}°")
+    ml = S.ml
+    m[7].metric("ML dataset label", f"Label {ml['prediction']}" if ml.get("available") else "Unavailable",
+                f"{ml['confidence'] * 100:.1f}% confidence" if ml.get("available") else None,
+                help="Experimental binary-model output; class meaning and live units must be validated.")
 
-    tabs = st.tabs(["🎯 Situation", "🗺️ Fleet", "🌐 3D Twin", "🏗️ Architecture", "📈 Analytics", "🔮 Forecast",
-                    "🧪 Geotech Lab", "⏪ Replay", "🩺 Node Health", "🚨 Response", "📥 Reports & Export"])
-    for tab, fn in zip(tabs, (tab_situation, tab_fleet, tab_twin, tab_architecture, tab_analytics, tab_forecast,
-                              tab_geotech, tab_replay, tab_health, tab_response, tab_export)):
+    tabs = st.tabs(["🎯 Situation", "🗺️ Fleet", "🌐 3D Twin", "🏗️ Architecture", "🧠 ML Diagnostics",
+                    "📈 Analytics", "🔮 Forecast", "🧪 Geotech Lab", "⏪ Replay", "🩺 Node Health",
+                    "🚨 Recipients & Alerts", "📥 Reports & Export"])
+    for tab, fn in zip(tabs, (tab_situation, tab_fleet, tab_twin, tab_architecture, tab_ml,
+                              tab_analytics, tab_forecast, tab_geotech, tab_replay, tab_health,
+                              tab_response, tab_export)):
         with tab:
             fn(S)
 
