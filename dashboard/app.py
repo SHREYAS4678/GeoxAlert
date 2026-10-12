@@ -1394,10 +1394,15 @@ def tab_architecture(S):
 
     st.markdown("#### Data flow")
     st.markdown(
-        "1. **Sensors → ESP32:** soil moisture, rain index, temperature, humidity, vibration and IMU readings are sampled and packaged as JSON.\\n"
-        "2. **ESP32 → network:** Wi-Fi is attempted first; SIM800L GPRS is the fallback. If both links fail, telemetry is buffered in LittleFS and replayed after reconnection.\\n"
-        "3. **Firebase Realtime Database:** live readings are written to /nodes/<node_id>/live; historical samples are written to /nodes/<node_id>/history.\\n"
-        "4. **Streamlit Command Hub:** reads Firebase data and visualizes sensor status, hazard score, infinite-slope Factor of Safety, history, forecasts, anomalies and reports."
+        """
+1. **Sensors → ESP32:** Soil moisture, rain index, temperature, humidity, vibration and IMU readings are sampled and packaged as JSON.
+
+2. **ESP32 → network:** Wi-Fi is attempted first; SIM800L GPRS is the fallback. If both links fail, telemetry is buffered in LittleFS and replayed after reconnection.
+
+3. **Firebase Realtime Database:** Live readings are written to `/nodes/<node_id>/live`; historical samples are written to `/nodes/<node_id>/history`.
+
+4. **Streamlit Command Hub:** Reads Firebase data and visualizes sensor status, hazard score, infinite-slope Factor of Safety, history, forecasts, anomalies and reports.
+"""
     )
     st.info(
         "This version has no cloud SMS worker and no physical siren/relay. "
