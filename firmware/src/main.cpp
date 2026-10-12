@@ -927,21 +927,15 @@ bool firebaseLoginGSM() {
 // ============================================================
 
 bool firebaseWiFiUpload(
-
     const String& path,
-
     const String& payload,
-
     bool putRequest
-
 ) {
-
-    if (idToken.length() == 0) {
-
-        if (!firebaseLoginWiFi())
-
-            return false;
-
+    const bool tokenExpired = tokenLife > 60000UL &&
+        (millis() - tokenCreated >= tokenLife - 60000UL);
+    if (idToken.length() == 0 || tokenExpired) {
+        idToken = "";
+        if (!firebaseLoginWiFi()) return false;
     }
 
     HTTPClient http;
@@ -1013,21 +1007,15 @@ bool firebaseWiFiUpload(
 // ============================================================
 
 bool firebaseGSMUpload(
-
     const String& path,
-
     const String& payload,
-
     bool putRequest
-
 ) {
-
-    if (idToken.length() == 0) {
-
-        if (!firebaseLoginGSM())
-
-            return false;
-
+    const bool tokenExpired = tokenLife > 60000UL &&
+        (millis() - tokenCreated >= tokenLife - 60000UL);
+    if (idToken.length() == 0 || tokenExpired) {
+        idToken = "";
+        if (!firebaseLoginGSM()) return false;
     }
 
     String fullPath =
