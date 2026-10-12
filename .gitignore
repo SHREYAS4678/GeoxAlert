@@ -6,7 +6,6 @@ __pycache__/
 dashboard/.streamlit/secrets.toml
 .env
 .env.*
-!.env.example
 
 # Firmware secrets/build products
 firmware/include/secrets.h
@@ -25,3 +24,7 @@ private/
 data/*.csv
 models/
 *.log
+
+# Firebase local debug output and rules backups
+firebase-debug.log
+database.rules.json.*.bak
