@@ -19,6 +19,7 @@ Run: streamlit run geoalert_hub_v3.py
 from __future__ import annotations
 
 import inspect
+import re
 import io
 import json
 import time
@@ -456,35 +457,45 @@ def parse_live(live):
     return s, live.get("network_status", {"active_interface": "Wi-Fi (Online)", "rssi": -62}), True, extras
 
 def normalize_history(raw, sensors):
-    """Firebase push-id dict -> tidy, time-sorted DataFrame (or None)."""
+    """Firebase push-ID dict -> time-sorted data; ignore uptime-only timestamps."""
     if not raw or not isinstance(raw, dict):
         return None
-    recs = [v for v in raw.values() if isinstance(v, dict)]
-    if not recs:
+    records = [value for value in raw.values() if isinstance(value, dict)]
+    if not records:
         return None
-    df = pd.json_normalize(recs)
-    df.columns = [c.split(".")[-1] for c in df.columns]
+    df = pd.json_normalize(records)
+    df.columns = [column.split(".")[-1] for column in df.columns]
     df = df.loc[:, ~df.columns.duplicated()]
-    ts_col = next((c for c in ("timestamp", "ts", "time", "datetime") if c in df.columns), None)
-    ts = None
-    if ts_col is not None:
-        s = df[ts_col]
-        if pd.api.types.is_numeric_dtype(s):
-            ts = pd.to_datetime(s, unit="ms" if s.dropna().median() > 1e11 else "s", utc=True, errors="coerce")
-        else:
-            ts = pd.to_datetime(s, utc=True, errors="coerce")
-        if ts.notna().any() and ts.min().year < 2000:  # device uptime rather than wall-clock
-            ts = None
-    if ts is None:
-        ts = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=len(df), freq="min")
+    ts_col = next((name for name in ("timestamp", "ts", "time", "datetime") if name in df.columns), None)
+    if ts_col is None:
+        return None
+
+    raw_ts = df[ts_col]
+    if pd.api.types.is_numeric_dtype(raw_ts):
+        numeric_ts = pd.to_numeric(raw_ts, errors="coerce")
+        ts = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns, UTC]")
+        # Unix milliseconds and Unix seconds are accepted; ESP32 uptime is not calendar time.
+        ms_mask = numeric_ts > 1e11
+        sec_mask = (numeric_ts >= 1e9) & (numeric_ts <= 1e11)
+        if ms_mask.any():
+            ts.loc[ms_mask] = pd.to_datetime(numeric_ts.loc[ms_mask], unit="ms", utc=True, errors="coerce")
+        if sec_mask.any():
+            ts.loc[sec_mask] = pd.to_datetime(numeric_ts.loc[sec_mask], unit="s", utc=True, errors="coerce")
+    else:
+        ts = pd.to_datetime(raw_ts, utc=True, errors="coerce")
+    if ts.notna().sum() == 0:
+        return None
+
     df["timestamp"] = ts
-    for c in SENSOR_COLS:
-        df[c] = pd.to_numeric(df[c], errors="coerce") if c in df.columns else sensors[c]
-        df[c] = df[c].ffill().bfill().fillna(sensors[c])
+    df = df.loc[df["timestamp"].notna()].copy()
+    for column in SENSOR_COLS:
+        df[column] = pd.to_numeric(df[column], errors="coerce") if column in df.columns else sensors[column]
+        df[column] = df[column].ffill().bfill().fillna(sensors[column])
     if "pitch_deg" in df.columns and "roll_deg" in df.columns:
         df["tilt_angle_deg"] = resultant_tilt_deg(df["pitch_deg"], df["roll_deg"])
     df = df.dropna(subset=["timestamp"]).sort_values("timestamp").tail(500).reset_index(drop=True)
     return df[["timestamp"] + SENSOR_COLS] if len(df) else None
+
 
 
 def synth_history(sensors, node_id, n=120):
