@@ -43,46 +43,6 @@ const char* GPRS_APN = GEOALERT_GPRS_APN;
 const char* GPRS_USER = GEOALERT_GPRS_USER;
 const char* GPRS_PASS = GEOALERT_GPRS_PASS;
 
-// ============================================================
-
-// ---------- Wi-Fi ----------
-
-const char* WIFI_SSID = "CHANGE_ME_WIFI_SSID";
-
-const char* WIFI_PASSWORD = "CHANGE_ME_WIFI_PASSWORD";
-
-// ---------- Firebase ----------
-
-const char* FIREBASE_API_KEY =
-
-    "CHANGE_ME_FIREBASE_WEB_API_KEY";
-
-const char* FIREBASE_DB_URL =
-
-    "https://geoalert-ai-ee1fd-default-rtdb.asia-southeast1.firebasedatabase.app";
-
-const char* FIREBASE_EMAIL =
-
-    "CHANGE_ME_FIREBASE_AUTH_EMAIL";
-
-const char* FIREBASE_PASSWORD =
-
-    "CHANGE_ME_FIREBASE_PASSWORD";
-
-// ---------- Device ----------
-
-const char* DEVICE_ID = "geoalert-node-01";
-
-// ---------- SIM800L ----------
-
-const char* GPRS_APN = "www";
-
-const char* GPRS_USER = "";
-
-const char* GPRS_PASS = "";
-
-// ============================================================
-
 // PINS
 
 // ============================================================
