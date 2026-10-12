@@ -20,10 +20,6 @@ function TomlQuote([string]$Value) {
     $Value = $Value.Replace([string][char]13, '').Replace([string][char]10, '\n')
     return '"' + $Value + '"'
 }
-function EnvSafe([string]$Value) {
-    if ($null -eq $Value) { return '' }
-    return $Value.Replace([string][char]13, '').Replace([string][char]10, '')
-}
 function Write-Utf8NoBom([string]$Path, [string[]]$Lines) {
     $fullPath = Join-Path $Root $Path
     $content = ($Lines -join [Environment]::NewLine) + [Environment]::NewLine
@@ -31,7 +27,7 @@ function Write-Utf8NoBom([string]$Path, [string[]]$Lines) {
     [System.IO.File]::WriteAllText($fullPath, $content, $encoding)
 }
 
-New-Item -ItemType Directory -Force -Path '.\firmware\include', '.\dashboard\.streamlit', '.\private' | Out-Null
+New-Item -ItemType Directory -Force -Path '.\firmware\include', '.\dashboard\.streamlit' | Out-Null
 Write-Host 'GeoAlert local configuration' -ForegroundColor Cyan
 Write-Host 'Use newly rotated credentials. Never commit generated files.' -ForegroundColor Yellow
 
@@ -78,38 +74,8 @@ $toml = @(
 )
 Write-Utf8NoBom '.\dashboard\.streamlit\secrets.toml' $toml
 
-$service = Read-Host 'Path to a NEW Firebase Admin SDK service-account JSON for Twilio worker (blank to skip cloud worker)'
-$serviceRel = 'private/firebase-service-account.json'
-if (-not [string]::IsNullOrWhiteSpace($service)) {
-    $service = $service.Trim().Trim('"')
-    if (-not (Test-Path -LiteralPath $service -PathType Leaf)) { throw "File not found: $service" }
-    try { $obj = Get-Content -LiteralPath $service -Raw | ConvertFrom-Json } catch { throw 'Service-account file is invalid JSON. Generate a fresh file from Firebase Console.' }
-    if ($obj.type -ne 'service_account' -or -not $obj.private_key -or -not $obj.client_email) { throw 'Not a complete service-account file. Do not append firmware config to JSON.' }
-    Copy-Item -LiteralPath $service -Destination $serviceRel -Force
-}
-
-$configureTwilio = Read-Host 'Configure Twilio cloud SMS worker now? Type YES to configure, otherwise skip [no]'
-$sid = ''; $twToken = ''; $from = ''
-if ($configureTwilio -ceq 'YES') {
-    $sid = Read-Host 'Twilio Account SID'
-    $twToken = Read-SecretText 'Twilio Auth Token'
-    $from = Read-Host 'Twilio sender phone number in +countrycode format'
-}
-$envLines = @(
-    '# Generated locally. Do not commit this file.',
-    "FIREBASE_DATABASE_URL=$(EnvSafe $db)",
-    "FIREBASE_SERVICE_ACCOUNT_PATH=$(EnvSafe $serviceRel)",
-    "TWILIO_ACCOUNT_SID=$(EnvSafe $sid)",
-    "TWILIO_AUTH_TOKEN=$(EnvSafe $twToken)",
-    "TWILIO_FROM_NUMBER=$(EnvSafe $from)",
-    'POLL_INTERVAL_SECONDS=5'
-)
-Write-Utf8NoBom '.\.env' $envLines
-
 Write-Host ''
 Write-Host 'Local configuration files created:' -ForegroundColor Green
 Write-Host '  firmware/include/secrets.h'
 Write-Host '  dashboard/.streamlit/secrets.toml'
-Write-Host '  .env'
-if (Test-Path -LiteralPath $serviceRel) { Write-Host '  private/firebase-service-account.json' }
 Write-Host 'These files are ignored by Git. Never upload or share them.' -ForegroundColor Yellow
