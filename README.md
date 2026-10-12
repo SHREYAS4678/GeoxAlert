@@ -1,21 +1,37 @@
 # GeoAlert — AI/IoT landslide-monitoring prototype
 
-GeoAlert combines ESP32 telemetry, Firebase Realtime Database, a Streamlit Command Hub, a weighted sensor-risk score/infinite-slope Factor of Safety heuristic, and optional GSM/cloud notifications.
+GeoAlert combines ESP32 sensor telemetry, Firebase Realtime Database, and a Streamlit Command Hub with an interactive architecture diagram, weighted hazard score, infinite-slope Factor of Safety (FoS), forecasts, anomaly checks and reports.
 
-> **Security first:** Wi-Fi and Firebase credentials plus a Firebase service-account private key were shared during troubleshooting. Treat them as compromised: change the Wi-Fi and Firebase Authentication passwords, revoke/delete the exposed service-account key in Google Cloud IAM, and restrict the Firebase Web API key. Generate a replacement Admin SDK key only if you need the optional Twilio worker. Never commit `.env`, `secrets.h`, Streamlit secrets or service-account JSON.
+> **Security:** Wi-Fi and Firebase credentials, plus a Firebase service-account private key, were shared during troubleshooting. Treat them as compromised: change the Wi-Fi and Firebase Authentication passwords, revoke/delete the exposed service-account key in Google Cloud IAM, and restrict the Firebase Web API key. This version does not require a Firebase service-account file for its dashboard or firmware path. Never commit local secrets or service-account JSON.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A["Sensors<br/>Soil moisture · FC-37<br/>DHT22 · SW-420 · IMU"] --> B["ESP32 edge<br/>JSON telemetry"]
+    B --> C["Network failover<br/>Wi-Fi primary<br/>SIM800L GPRS fallback"]
+    B <--> D["LittleFS offline queue<br/>Buffer / replay"]
+    C --> E[("Firebase Realtime Database")]
+    E --> F["Streamlit Command Hub"]
+    F --> G["Risk score · FoS<br/>Forecasts · Health<br/>Analytics · Exports"]
+    B -. "optional, disabled by default" .-> H["Direct SIM800L SMS"]
+```
+
+The dashboard also includes an interactive Plotly architecture visualization. Telemetry paths are `/nodes/<node_id>/live` and `/nodes/<node_id>/history`. When both network links are unavailable, firmware can spool records to LittleFS and replay them after reconnection.
 
 ## Repository contents
 
-- `firmware/src/main.cpp` and `firmware/platformio.ini`: ESP32 Arduino/PlatformIO firmware using the soil sensor, FC-37, DHT22, SW-420, MPU-compatible IMU, Firebase REST, Wi-Fi/GPRS failover and LittleFS spool.
-- `dashboard/app.py`: Streamlit Command Hub with Firebase REST access, weighted hazard score, infinite-slope FoS, forecast/anomaly views, history and exports. It no longer suggests that the prototype has a physical siren.
-- `backend/twilio_worker.py`: optional Twilio SMS queue worker; requires new credentials, service-account JSON and an explicit destination number per queued item.
+- `firmware/src/main.cpp` and `firmware/platformio.ini`: ESP32 Arduino/PlatformIO firmware for soil moisture, FC-37, DHT22, SW-420, MPU-compatible IMU, Firebase REST, Wi-Fi/GPRS failover and LittleFS spool.
+- `dashboard/app.py`: Streamlit Command Hub, Firebase live reader, hazard calculations, history, architecture visualization and exports.
 - `train_models.py`: reproducible Random Forest, XGBoost and soft-voting training pipeline.
-- `scripts/`: PowerShell configuration, setup, training, firmware build/upload/monitor, dashboard and optional alert-worker launchers.
+- `scripts/`: PowerShell configuration, setup, training, firmware build/upload/monitor and dashboard launchers.
 - `docs/`: architecture, Firebase configuration and ML evaluation caveats.
 
-The repository intentionally excludes local credentials, model binaries and CSV files via `.gitignore`. The provided **complete deployment ZIP** includes the 9,864-row training CSV and trained model artifacts; extract it to train/use the supplied artifacts, or copy your dataset into `data/geoalert_training_dataset.csv`.
+Local credentials, model binaries and CSV files are excluded via `.gitignore`. Copy the training CSV into `data/geoalert_training_dataset.csv` before retraining.
 
 ## Quick start (Windows PowerShell)
+
+From the GeoAlert project root:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
@@ -23,21 +39,21 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\configure.ps1
 ```
 
-After rotating the exposed credentials, complete the local prompts. Keep `geoalert-node-01` as the Node ID unless intentionally changing it. Do not enable direct GSM SMS until the exact SIM800L board power, SIM readiness, antenna and network registration have been checked.
+Complete the Wi-Fi and Firebase prompts using newly rotated credentials. Keep `geoalert-node-01` as the Node ID unless the firmware intentionally uses another ID. Direct SIM800L SMS is optional, firmware-side, and disabled by default. No physical siren or relay is installed.
 
-## Train the supplied data/models
+## Train models
 
-The included training dataset has these predictors:
+The supplied dataset predictors are:
 
 `soil_moisture, rainfall, temperature, humidity, roll, pitch, yaw, vibration`
 
-Target: numeric `label` (classes 0 and 1). To retrain on Windows, make sure `data/geoalert_training_dataset.csv` exists, then run:
+The target is numeric `label` (classes 0 and 1). To retrain on Windows, ensure `data/geoalert_training_dataset.csv` exists, then run:
 
 ```powershell
 .\scripts\train-models.ps1
 ```
 
-The script writes `models/random_forest_model.pkl`, `models/xgboost_model.pkl`, `models/voting_ensemble_model.pkl`, `models/scaler.pkl`, `models/feature_order.json`, and reports under `reports/`.
+The script writes trained models under `models/` and evaluation reports under `reports/`.
 
 ### Holdout metrics for the supplied CSV
 
@@ -49,14 +65,14 @@ A stratified 80/20 holdout with seed 42 yielded:
 | XGBoost | 99.65% | 99.65% | 0.9998 |
 | Soft-voting ensemble | 99.65% | 99.65% | 0.9997 |
 
-See [training results and limitations](docs/training-results.md). These unusually strong metrics apply to this dataset only and do not prove real-world landslide performance.
+These unusually strong metrics apply to the supplied dataset only and do not prove real-world landslide performance. See `docs/training-results.md`.
 
 ### Critical ML limitations
 
-- The dataset does not define whether label 0 or 1 means normal, risk or landslide. The model is binary; it does not produce four hazard tiers.
-- The rainfall unit is not documented. The hardware FC-37 provides a wetness/index reading, not calibrated rainfall in millimetres. Do not assume they match.
+- The dataset does not define whether label 0 or 1 means normal, risk or landslide. It is binary and does not produce four hazard tiers.
+- The rainfall unit is undocumented. FC-37 provides a wetness/index reading, not calibrated rainfall in millimetres.
 - Firmware sensor units, IMU angle conventions and vibration aggregation must match the dataset before live model inference.
-- The current Streamlit dashboard still uses the weighted heuristic and Factor of Safety. The trained artifacts are not yet wired into the dashboard's live hazard tier; do not relabel model class 0/1 as operational tiers until semantics and units are confirmed.
+- The current dashboard uses a weighted heuristic and Factor of Safety. The trained artifacts are not wired into the live hazard tier. Do not treat binary classes as operational hazard tiers without validating semantics and units.
 
 ## Build and upload firmware
 
@@ -66,7 +82,7 @@ See [training results and limitations](docs/training-results.md). These unusuall
 .\scripts\monitor-serial.ps1
 ```
 
-The uploader asks for a COM port. Close the serial monitor before uploading. Pin map: soil GPIO 34, FC-37 GPIO 35, DHT22 GPIO 4, SW-420 GPIO 5, I2C SDA 21/SCL 22, SIM800L TXD to ESP32 RX GPIO 16 and ESP32 TX GPIO 17 to SIM800L RXD. Power SIM800L according to the exact V2 board specification with sufficient transient current and a shared ground.
+The uploader asks for a COM port. Close the serial monitor before uploading. Pin map: soil GPIO 34, FC-37 GPIO 35, DHT22 GPIO 4, SW-420 GPIO 5, I2C SDA 21/SCL 22, SIM800L TXD to ESP32 RX GPIO 16 and ESP32 TX GPIO 17 to SIM800L RXD. Follow the exact SIM800L V2 board power requirements and use a shared ground.
 
 ## Run dashboard
 
@@ -74,18 +90,10 @@ The uploader asks for a COM port. Close the serial monitor before uploading. Pin
 .\scripts\run-dashboard.ps1
 ```
 
-Open http://localhost:8501. This version is a Streamlit-only dashboard and does not need the previous port-8000 backend. Without correct Firebase access, readings may be demo/offline values rather than live sensor data.
+Open http://localhost:8501. The dashboard is Streamlit-only and does not require a separate port-8000 API. If Firebase access is misconfigured, values may be demo/offline rather than live sensor readings.
 
-## Optional Twilio cloud SMS
+## Alerts and safety
 
-Configure new Twilio credentials and a newly generated Firebase Admin service account locally, then run:
+The dashboard records and displays events. Optional webhook escalation notifications can be configured in the sidebar. Direct SMS through SIM800L is a separate optional firmware feature and is disabled by default. This version has no cloud SMS worker or dashboard SMS queue; no physical siren or relay is installed. Logging or displaying an event does not prove that a person received an alert.
 
-```powershell
-.\scripts\run-alert-worker.ps1
-```
-
-Each queued message needs an explicit recipient phone number. Queueing is not proof of delivery; check Twilio and worker status. Charges may apply. Direct SIM800L SMS is an opt-in prototype. No physical siren or relay is installed.
-
-## Safety
-
-GeoAlert is an experimental decision-support prototype, not a certified landslide-warning system. Do not rely on it as the sole basis for evacuation or other public-safety decisions. Validate sensors, soil/geotechnical parameters, thresholds, class semantics, and notification delivery with qualified personnel and local authorities.
+GeoAlert is an experimental decision-support prototype, not a certified landslide-warning system. Do not use it as the sole basis for evacuation or public-safety decisions. Validate sensors, soil/geotechnical parameters, thresholds and alert procedures with qualified personnel and local authorities.
