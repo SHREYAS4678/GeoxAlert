@@ -1,0 +1,30 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "nodes": {
+      ".read": "auth != null",
+      "$nodeId": {
+        "live": {
+          ".write": "auth != null"
+        },
+        "history": {
+          ".write": "auth != null"
+        },
+        "meta": {
+          ".read": "auth != null"
+        },
+        "contacts": {
+          ".read": "auth != null",
+          ".write": "auth != null"
+        },
+        "alerts": {
+          "queue": {
+            ".read": "auth != null",
+            ".write": "auth != null"
+          }
+        }
+      }
+    }
+  }
+}
