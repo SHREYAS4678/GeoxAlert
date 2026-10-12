@@ -38,7 +38,7 @@ Queueing is not proof of SMS delivery. SMS requires stable SIM800L power, a read
 
 ## Machine learning
 
-The repository contains `data/geoalert_training_dataset.csv`, trained artifacts under `models/`, evaluation reports under `reports/`, and `train_models.py`. The pipeline trains Random Forest, XGBoost, and a soft-voting ensemble. The dashboard loads the ensemble for **experimental binary inference**.
+The repository contains `train_models.py` and the model-training workflow. The **complete deployment ZIP** includes `data/geoalert_training_dataset.csv`, pre-trained artifacts under `models/`, and evaluation reports under `reports/`. The GitHub repository intentionally excludes the CSV and model binaries via `.gitignore`, so copy the CSV to `data/geoalert_training_dataset.csv` and train/download the included artifacts before using ML inference in a fresh Git clone.
 
 The supplied dataset has features `soil_moisture, rainfall, temperature, humidity, roll, pitch, yaw, vibration` and binary target `label`. A stratified random 80/20 holdout reported about 99.65–99.70% accuracy on that dataset. **This is test-split accuracy, not demonstrated field accuracy.** The meaning of labels 0 and 1 is not documented, and dataset rainfall units have not been confirmed as equivalent to the FC-37 rain index. The dashboard displays `Label 0`/`Label 1` and probabilities, but does not map that output directly to operational risk tiers or SMS.
 
