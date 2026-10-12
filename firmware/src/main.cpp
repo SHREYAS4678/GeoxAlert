@@ -196,9 +196,6 @@ unsigned long lastSmsQueuePoll = 0;
 const unsigned long SMS_QUEUE_POLL_MS = 10000UL;
 
 bool modemReadyForSMS = false;
-unsigned long lastDirectSmsAt = 0;
-const unsigned long DIRECT_SMS_COOLDOWN_MS = 15UL * 60UL * 1000UL;
-
 // ============================================================
 
 // LITTLEFS
